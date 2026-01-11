@@ -1,6 +1,5 @@
 import cv2
 import mediapipe as mp
-from mediapipe.python.solutions import pose as mp_pose
 import time
 import random
 import math
@@ -16,7 +15,7 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 class BoxingAnalystLogic:
     def __init__(self):
         # 1. 初始化 MediaPipe
-        self.mp_pose = mp_pose
+       self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
@@ -304,3 +303,4 @@ webrtc_streamer(
     async_processing=True,
 
 )
+
