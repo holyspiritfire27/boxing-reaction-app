@@ -1,9 +1,5 @@
 import cv2
 import mediapipe as mp
-# [關鍵修正] 強制導入模組，解決 Streamlit Cloud AttributeError
-import mediapipe.solutions.pose as mp_pose_impl
-import mediapipe.solutions.drawing_utils as mp_drawing_impl
-
 import time
 import random
 import math
@@ -18,14 +14,15 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
-        # [關鍵修正] 使用強制導入的模組
-        self.mp_pose = mp_pose_impl
+        # [改回標準寫法]
+        # 只要 packages.txt 設定正確，這裡就不會報錯
+        self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
             model_complexity=0  # 手機端使用輕量模型
         )
-        self.mp_drawing = mp_drawing_impl
+        self.mp_drawing = mp.solutions.drawing_utils
         
         # 2. 參數
         self.REAL_ARM_LENGTH_M = 0.85 
@@ -67,7 +64,7 @@ class BoxingAnalystLogic:
         self.last_frame_time = time.time()
         self.calibration_timer = 0
         
-        # 字型 (網頁版使用預設)
+        # 字型
         self.font_path = "arial.ttf" 
 
     def get_3d_distance_px(self, p1, p2, w, h):
@@ -94,7 +91,7 @@ class BoxingAnalystLogic:
 
     def check_guard_pose(self, landmarks, w, h):
         nose = landmarks[0]
-        # Index Swap 修正 (左右手反轉以配合鏡像)
+        # Index Swap 修正
         rw, lw = landmarks[15], landmarks[16]
         dist_r = self.get_3d_distance_px(rw, nose, w, h)
         dist_l = self.get_3d_distance_px(lw, nose, w, h)
@@ -104,11 +101,9 @@ class BoxingAnalystLogic:
         return (dist_r < threshold_px) and (dist_l < threshold_px)
 
     def put_text(self, img, text, pos, color=(0, 255, 0), size=30):
-        # 簡化版文字繪製
         img_pil = Image.fromarray(img)
         draw = ImageDraw.Draw(img_pil)
         try:
-            # 嘗試載入 Linux 常見字型，失敗則用預設
             font = ImageFont.truetype("DejaVuSans.ttf", size) 
         except:
             font = ImageFont.load_default()
@@ -117,7 +112,7 @@ class BoxingAnalystLogic:
         return np.array(img_pil)
 
     def process_frame(self, frame):
-        # 翻轉 (鏡像)
+        # 翻轉
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
         
@@ -131,7 +126,7 @@ class BoxingAnalystLogic:
         if results.pose_landmarks:
             lm = results.pose_landmarks.landmark
             nose = lm[0]
-            # Index Swap (解決鏡像問題)
+            # Index Swap
             mp_rw = lm[15] 
             mp_lw = lm[16]
             mp_rs = lm[11] 
@@ -223,7 +218,6 @@ class BoxingAnalystLogic:
                     self.val_reaction_time = self.t_move_start - self.t_signal
                     self.val_movement_time = self.t_hit - self.t_move_start
                     
-                    # 判定：右手肘累積 > 左手肘累積 -> 右手
                     if self.accum_elbow_r > self.accum_elbow_l:
                         self.active_hand = "RIGHT"
                     else:
