@@ -1,5 +1,9 @@
 import cv2
 import mediapipe as mp
+# [新增] 強制導入 pose 模組，確保它被載入
+import mediapipe.solutions.pose as mp_pose_impl 
+import mediapipe.solutions.drawing_utils as mp_drawing_impl
+
 import time
 import random
 import math
@@ -9,13 +13,19 @@ import av
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
-# ==========================================
-# 核心邏輯類別 (BoxingAnalyst Logic)
-# ==========================================
+# ... (略)
+
 class BoxingAnalystLogic:
     def __init__(self):
-        # 1. 初始化 MediaPipe (修正縮排)
-        self.mp_pose = mp.solutions.pose
+        # [修改] 使用剛剛強制導入的變數
+        self.mp_pose = mp_pose_impl
+        self.pose = self.mp_pose.Pose(
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+            model_complexity=0 
+        )
+        # [修改] 使用強制導入的繪圖工具
+        self.mp_drawing = mp_drawing_impl
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
@@ -294,3 +304,4 @@ webrtc_streamer(
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
+
