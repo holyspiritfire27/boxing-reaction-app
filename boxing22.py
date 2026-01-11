@@ -14,12 +14,12 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
-        # 1. 初始化 MediaPipe
-       self.mp_pose = mp.solutions.pose
+        # 1. 初始化 MediaPipe (修正縮排)
+        self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
-            model_complexity=0
+            model_complexity=0 
         )
         self.mp_drawing = mp.solutions.drawing_utils
         
@@ -63,7 +63,7 @@ class BoxingAnalystLogic:
         self.last_frame_time = time.time()
         self.calibration_timer = 0
         
-        # 字型 (網頁版改用預設，避免找不到檔案錯誤)
+        # 字型 (網頁版改用預設)
         self.font_path = "arial.ttf" 
 
     def get_3d_distance_px(self, p1, p2, w, h):
@@ -100,12 +100,11 @@ class BoxingAnalystLogic:
         return (dist_r < threshold_px) and (dist_l < threshold_px)
 
     def put_text(self, img, text, pos, color=(0, 255, 0), size=30):
-        # 簡化版文字繪製，避免手機端字型路徑問題
+        # 簡化版文字繪製
         img_pil = Image.fromarray(img)
         draw = ImageDraw.Draw(img_pil)
-        # 嘗試加載預設字體
         try:
-            font = ImageFont.truetype("DejaVuSans.ttf", size) # Linux/Streamlit Cloud 常見字體
+            font = ImageFont.truetype("DejaVuSans.ttf", size) 
         except:
             font = ImageFont.load_default()
         
@@ -113,10 +112,6 @@ class BoxingAnalystLogic:
         return np.array(img_pil)
 
     def process_frame(self, frame):
-        # 1. 基礎處理
-        # 網頁傳來的影像是 RGB，OpenCV 習慣 BGR，但 PIL 繪圖又要 RGB
-        # 這裡我們統一轉為 RGB 處理，最後回傳 RGB (Streamlit WebRTC 會自動處理)
-        
         # 翻轉 (鏡像)
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
@@ -280,10 +275,7 @@ class VideoProcessor(VideoTransformerBase):
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        
-        # 執行核心邏輯
         processed_img = self.logic.process_frame(img)
-        
         return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
 
 # ==========================================
@@ -301,6 +293,4 @@ webrtc_streamer(
     video_processor_factory=VideoProcessor,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
-
 )
-
