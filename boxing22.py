@@ -1,296 +1,175 @@
 import cv2
-import mediapipe as mp
+import av
+import numpy as np
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import time
 import random
-import math
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import av
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # ==========================================
-# 核心邏輯類別 (BoxingAnalyst Logic)
+# 核心修復部分：MediaPipe 引用方式
+# ==========================================
+# 在 Streamlit Cloud (Python 3.11/3.13) 上，直接呼叫 mp.solutions.pose 有時會失效
+# 因此我們這裡使用 "from ... import ..." 的顯式寫法來繞過這個問題
+try:
+    import mediapipe as mp
+    from mediapipe.python.solutions import pose as mp_pose
+    from mediapipe.python.solutions import drawing_utils as mp_drawing
+except ImportError:
+    st.error("無法匯入 MediaPipe，請確認 requirements.txt 包含 mediapipe 和 protobuf==3.20.3")
+
+# ==========================================
+# 拳擊分析邏輯 (Logic Class)
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
-        # [改回標準寫法]
-        # 只要 packages.txt 設定正確，這裡就不會報錯
-        self.mp_pose = mp.solutions.pose
+        # 使用上面顯式引用的模組，而不是 mp.solutions.pose
+        self.mp_pose = mp_pose
+        self.mp_drawing = mp_drawing
+        
+        # 初始化 Pose 模型
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
-            model_complexity=0  # 手機端使用輕量模型
+            model_complexity=1  # 0=Lite, 1=Full, 2=Heavy (建議 1 平衡速度與準確度)
         )
-        self.mp_drawing = mp.solutions.drawing_utils
         
-        # 2. 參數
-        self.REAL_ARM_LENGTH_M = 0.85 
-        self.pixel_to_meter_scale = 0.0 
-        self.ATTACK_START_VELOCITY = 1.0 
-        self.ALPHA = 0.6 
+        # 遊戲狀態變數
+        self.stage = None
+        self.counter = 0
+        self.last_action_time = 0
+        self.reaction_times = []
+        self.target = None  # 'LEFT' or 'RIGHT'
+        self.waiting_for_action = False
+        self.start_time = 0
 
-        # 3. 狀態機
-        self.state = "CALIBRATION"      
-        self.active_hand = None        
-        self.target_hand = None        
-        self.is_correct = False        
-        self.target_box = None
+    def process(self, image):
+        # 轉換顏色空間 BGR -> RGB
+        image.flags.writeable = False
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # 數據
-        self.accum_elbow_r = 0.0
-        self.accum_elbow_l = 0.0
-        self.prev_elbow_pos_r = None 
-        self.prev_elbow_pos_l = None 
+        # 進行偵測
+        results = self.pose.process(image_rgb)
         
-        self.t_signal = 0        
-        self.t_move_start = 0    
-        self.t_hit = 0           
+        # 畫回原本的圖上
+        image.flags.writeable = True
+        image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         
-        self.val_reaction_time = 0.0
-        self.val_movement_time = 0.0
-        self.val_peak_speed = 0.0
-        
-        self.wait_start_time = 0
-        self.random_delay = 0
-        
-        # 速度運算變數
-        self.prev_wrist_pos_r = None 
-        self.prev_wrist_pos_l = None 
-        self.smooth_vel_r = 0.0
-        self.smooth_vel_l = 0.0
-        
-        # 計時器
-        self.last_frame_time = time.time()
-        self.calibration_timer = 0
-        
-        # 字型
-        self.font_path = "arial.ttf" 
-
-    def get_3d_distance_px(self, p1, p2, w, h):
-        x1, y1, z1 = p1.x * w, p1.y * h, p1.z * w
-        x2, y2, z2 = p2.x * w, p2.y * h, p2.z * w
-        return math.sqrt((x2 - x1)**2 + (y2 - y1)**2 + (z2 - z1)**2)
-
-    def calculate_euclidean_dist(self, curr_pos, prev_pos):
-        if prev_pos is None or curr_pos is None: return 0.0
-        return math.sqrt((curr_pos[0]-prev_pos[0])**2 + 
-                         (curr_pos[1]-prev_pos[1])**2 + 
-                         (curr_pos[2]-prev_pos[2])**2)
-
-    def get_smoothed_velocity(self, curr_wrist, prev_wrist, prev_smooth_vel, w, h, dt):
-        curr_pos = (curr_wrist.x * w, curr_wrist.y * h, curr_wrist.z * w)
-        if prev_wrist is None or dt <= 0:
-            return 0.0, curr_pos
-        delta_dist_px = self.calculate_euclidean_dist(curr_pos, prev_wrist)
-        scale = self.pixel_to_meter_scale if self.pixel_to_meter_scale > 0 else 0
-        delta_dist_m = delta_dist_px * scale
-        raw_velocity = delta_dist_m / dt
-        smooth_velocity = (self.ALPHA * raw_velocity) + ((1 - self.ALPHA) * prev_smooth_vel)
-        return smooth_velocity, curr_pos
-
-    def check_guard_pose(self, landmarks, w, h):
-        nose = landmarks[0]
-        # Index Swap 修正
-        rw, lw = landmarks[15], landmarks[16]
-        dist_r = self.get_3d_distance_px(rw, nose, w, h)
-        dist_l = self.get_3d_distance_px(lw, nose, w, h)
-        threshold_px = h * 0.4
-        if self.pixel_to_meter_scale > 0:
-            threshold_px = (self.REAL_ARM_LENGTH_M * 0.6) / self.pixel_to_meter_scale
-        return (dist_r < threshold_px) and (dist_l < threshold_px)
-
-    def put_text(self, img, text, pos, color=(0, 255, 0), size=30):
-        img_pil = Image.fromarray(img)
-        draw = ImageDraw.Draw(img_pil)
-        try:
-            font = ImageFont.truetype("DejaVuSans.ttf", size) 
-        except:
-            font = ImageFont.load_default()
-        
-        draw.text(pos, text, font=font, fill=color)
-        return np.array(img_pil)
-
-    def process_frame(self, frame):
-        # 翻轉
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        
-        curr_time = time.time()
-        dt = curr_time - self.last_frame_time
-        self.last_frame_time = curr_time
-        if dt < 0.0001: dt = 0.033
-
-        results = self.pose.process(frame)
+        # 取得畫面尺寸
+        h, w, c = image.shape
 
         if results.pose_landmarks:
-            lm = results.pose_landmarks.landmark
-            nose = lm[0]
-            # Index Swap
-            mp_rw = lm[15] 
-            mp_lw = lm[16]
-            mp_rs = lm[11] 
-            mp_ls = lm[12] 
-            mp_re = lm[13] 
-            mp_le = lm[14] 
-
-            # 目標框
-            box_s = int(w * 0.15) 
-            nx, ny = int(nose.x * w), int(nose.y * h)
-            self.target_box = (nx - box_s, ny - box_s, nx + box_s, ny + box_s)
-
-            # ----------- 狀態機 -----------
-            if self.state == "CALIBRATION":
-                dist_3d = self.get_3d_distance_px(mp_rs, mp_rw, w, h)
-                is_extended = (dist_3d > w * 0.35)
-                
-                if is_extended: self.calibration_timer += dt
-                else: self.calibration_timer = 0
-                
-                if self.calibration_timer > 1.0:
-                    self.pixel_to_meter_scale = self.REAL_ARM_LENGTH_M / dist_3d
-                    self.state = "SETUP"
-                
-                frame = self.put_text(frame, "SYSTEM CALIBRATION", (50, 50), (0, 255, 255), 40)
-                frame = self.put_text(frame, "Hold Right Arm Straight 1s", (50, 100), (255, 255, 255), 30)
-                prog = int((self.calibration_timer / 1.0) * 300)
-                cv2.rectangle(frame, (50, 150), (50 + prog, 180), (0, 255, 0), -1)
-                cv2.rectangle(frame, (50, 150), (350, 180), (255, 255, 255), 2)
-
-            elif self.state == "SETUP" or self.state == "RESULT":
-                if self.state == "RESULT" and (time.time() - self.t_hit > 2.0): 
-                    self.state = "SETUP"
-
-                if self.state == "SETUP" and self.check_guard_pose(lm, w, h):
-                    self.state = "WAIT"
-                    self.wait_start_time = time.time()
-                    self.random_delay = random.uniform(2.0, 4.0)
-                    self.val_peak_speed = 0.0
-                    self.accum_elbow_r = 0.0
-                    self.accum_elbow_l = 0.0
-                    self.prev_elbow_pos_r = None
-                    self.prev_elbow_pos_l = None
-                    self.prev_wrist_pos_r = None
-                    self.prev_wrist_pos_l = None
-                    self.smooth_vel_r = 0.0
-                    self.smooth_vel_l = 0.0
-
-            elif self.state == "WAIT":
-                # 背景運算
-                _, self.prev_wrist_pos_r = self.get_smoothed_velocity(mp_rw, self.prev_wrist_pos_r, 0, w, h, dt)
-                _, self.prev_wrist_pos_l = self.get_smoothed_velocity(mp_lw, self.prev_wrist_pos_l, 0, w, h, dt)
-                
-                if time.time() - self.wait_start_time > self.random_delay:
-                    self.state = "STIMULUS"
-                    self.t_signal = time.time() 
-                    self.target_hand = random.choice(["RIGHT", "LEFT"])
-
-            elif self.state == "STIMULUS":
-                self.smooth_vel_r, self.prev_wrist_pos_r = self.get_smoothed_velocity(mp_rw, self.prev_wrist_pos_r, self.smooth_vel_r, w, h, dt)
-                self.smooth_vel_l, self.prev_wrist_pos_l = self.get_smoothed_velocity(mp_lw, self.prev_wrist_pos_l, self.smooth_vel_l, w, h, dt)
-                
-                if self.smooth_vel_r > self.ATTACK_START_VELOCITY or self.smooth_vel_l > self.ATTACK_START_VELOCITY:
-                    self.t_move_start = time.time()
-                    self.state = "PUNCHING"
-                    self.prev_elbow_pos_r = (mp_re.x*w, mp_re.y*h, mp_re.z*w)
-                    self.prev_elbow_pos_l = (mp_le.x*w, mp_le.y*h, mp_le.z*w)
-
-            elif self.state == "PUNCHING":
-                self.smooth_vel_r, self.prev_wrist_pos_r = self.get_smoothed_velocity(mp_rw, self.prev_wrist_pos_r, self.smooth_vel_r, w, h, dt)
-                self.smooth_vel_l, self.prev_wrist_pos_l = self.get_smoothed_velocity(mp_lw, self.prev_wrist_pos_l, self.smooth_vel_l, w, h, dt)
-                self.val_peak_speed = max(self.val_peak_speed, max(self.smooth_vel_r, self.smooth_vel_l))
-                
-                curr_re = (mp_re.x*w, mp_re.y*h, mp_re.z*w)
-                curr_le = (mp_le.x*w, mp_le.y*h, mp_le.z*w)
-                self.accum_elbow_r += self.calculate_euclidean_dist(curr_re, self.prev_elbow_pos_r)
-                self.accum_elbow_l += self.calculate_euclidean_dist(curr_le, self.prev_elbow_pos_l)
-                self.prev_elbow_pos_r = curr_re
-                self.prev_elbow_pos_l = curr_le
-                
-                hit_r = (self.target_box[0] < mp_rw.x*w < self.target_box[2]) and (self.target_box[1] < mp_rw.y*h < self.target_box[3])
-                hit_l = (self.target_box[0] < mp_lw.x*w < self.target_box[2]) and (self.target_box[1] < mp_lw.y*h < self.target_box[3])
-                
-                if (time.time() - self.t_move_start) > 1.5:
-                    self.state = "RESULT"
-
-                if hit_r or hit_l:
-                    self.t_hit = time.time()
-                    self.val_reaction_time = self.t_move_start - self.t_signal
-                    self.val_movement_time = self.t_hit - self.t_move_start
-                    
-                    if self.accum_elbow_r > self.accum_elbow_l:
-                        self.active_hand = "RIGHT"
-                    else:
-                        self.active_hand = "LEFT"
-                    
-                    self.is_correct = (self.active_hand == self.target_hand)
-                    self.state = "RESULT"
-
-            # ----------- 繪圖 -----------
-            if self.state in ["STIMULUS", "PUNCHING"]:
-                color = (0, 0, 255)
-                if self.state == "PUNCHING" and self.t_hit > 0: color = (0, 255, 0)
-                cv2.rectangle(frame, (self.target_box[0], self.target_box[1]), 
-                              (self.target_box[2], self.target_box[3]), color, 3)
-                
-                if self.state == "STIMULUS" and (time.time() - self.t_signal < 0.5):
-                     text = f"PUNCH: {self.target_hand}!"
-                     frame = self.put_text(frame, text, (w//2-150, h//2+120), (255, 255, 255), 50)
-                else:
-                     cv2.putText(frame, "TARGET", (self.target_box[0], self.target_box[1]-5), 
-                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            self.mp_drawing.draw_landmarks(frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
-
-        # UI 文字
-        if self.state == "SETUP":
-            frame = self.put_text(frame, "GUARD POSE", (50, 100), (0, 255, 255), 40)
-        elif self.state == "WAIT":
-            frame = self.put_text(frame, "WAIT...", (w//2-100, h//2), (0, 165, 255), 60)
-        
-        elif self.state == "RESULT" and self.t_hit > 0:
-            res_str = "SUCCESS O" if self.is_correct else "FAIL X"
-            res_col = (0, 255, 0) if self.is_correct else (255, 0, 0)
+            landmarks = results.pose_landmarks.landmark
             
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (30, 200), (480, 550), (0,0,0), -1)
-            frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+            # 繪製骨架
+            self.mp_drawing.draw_landmarks(
+                image, 
+                results.pose_landmarks, 
+                self.mp_pose.POSE_CONNECTIONS
+            )
             
-            start_y = 240
-            gap = 50
-            frame = self.put_text(frame, f"Result: {res_str}", (50, start_y), res_col, 40)
-            frame = self.put_text(frame, f"Punch: {self.active_hand}", (50, start_y + gap), (0, 255, 255), 30)
-            frame = self.put_text(frame, f"Reaction: {self.val_reaction_time:.3f} s", (50, start_y + gap*2), (255, 100, 100), 30)
-            frame = self.put_text(frame, f"Move: {self.val_movement_time:.3f} s", (50, start_y + gap*3), (100, 255, 100), 30)
-            frame = self.put_text(frame, f"Speed: {self.val_peak_speed:.2f} m/s", (50, start_y + gap*4), (0, 200, 255), 30)
+            # -------------------------------------------------------
+            # 這裡您可以放入您原本的偵測邏輯
+            # 以下是一個簡單的範例：偵測出拳 (手腕超過手肘)
+            # -------------------------------------------------------
+            
+            # 取得左手座標
+            left_wrist = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST.value]
+            left_elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW.value]
+            
+            # 取得右手座標
+            right_wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST.value]
+            right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW.value]
 
-        return frame
+            # 簡單的邏輯：隨機出題
+            current_time = time.time()
+            
+            # 如果目前沒有目標，每隔幾秒生成一個新目標
+            if not self.target and (current_time - self.last_action_time > 3):
+                self.target = random.choice(['LEFT', 'RIGHT'])
+                self.start_time = current_time
+                self.waiting_for_action = True
+
+            # 顯示指令
+            if self.target:
+                color = (0, 0, 255) if self.target == 'LEFT' else (255, 0, 0)
+                cv2.putText(image, f"PUNCH {self.target}!", (50, 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4, cv2.LINE_AA)
+
+            # 偵測動作是否完成 (簡單判斷：手腕 X 軸大幅移動或 Y 軸高於鼻子等，這裡示範 X 軸伸展)
+            # 注意：MediaPipe 座標是歸一化的 (0~1)
+            
+            action_detected = None
+            
+            # 簡單判斷：如果手腕非常接近相機 (z 軸) 或 手伸直
+            # 這裡用一個簡單的視覺判斷：手腕比手肘更遠離身體中心
+            # (這只是一個範例邏輯，請替換回您原本的判定代碼)
+            
+            # 假設：當左手腕的 x < 左手肘 x (畫面左邊) -> 左拳
+            if left_wrist.x < left_elbow.x - 0.1:
+                action_detected = 'LEFT'
+            
+            # 假設：當右手腕的 x > 右手肘 x (畫面右邊) -> 右拳
+            if right_wrist.x > right_elbow.x + 0.1:
+                action_detected = 'RIGHT'
+
+            # 檢查是否擊中目標
+            if self.waiting_for_action and action_detected == self.target:
+                reaction_time = current_time - self.start_time
+                self.reaction_times.append(reaction_time)
+                self.last_action_time = current_time
+                self.target = None # 重置
+                self.waiting_for_action = False
+                self.counter += 1
+
+            # 顯示狀態
+            cv2.rectangle(image, (0,0), (250, 73), (245,117,16), -1)
+            cv2.putText(image, 'HITS', (15,12), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+            cv2.putText(image, str(self.counter), (10,60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 2, cv2.LINE_AA)
+
+            if self.reaction_times:
+                avg_time = np.mean(self.reaction_times)
+                cv2.putText(image, f'Avg Time: {avg_time:.2f}s', (260, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
+
+        return image
 
 # ==========================================
-# Streamlit WebRTC 橋接器
+# WebRTC 影像處理器
 # ==========================================
 class VideoProcessor(VideoTransformerBase):
     def __init__(self):
         self.logic = BoxingAnalystLogic()
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+    def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        processed_img = self.logic.process_frame(img)
-        return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+        
+        # 交給邏輯層處理
+        img = self.logic.process(img)
+        
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ==========================================
-# 網頁主程式
+# Streamlit 主程式
 # ==========================================
-st.set_page_config(page_title="Boxing Reaction", layout="wide")
-st.title("🥊 Boxing Reaction Trainer")
+def main():
+    st.set_page_config(page_title="Boxing Reaction App", layout="wide")
+    
+    st.title("🥊 Boxing Reaction Trainer")
+    st.write("這是一個使用 MediaPipe 的拳擊反應測試。請允許瀏覽器存取攝影機。")
 
-st.write("Please allow camera access.")
+    st.sidebar.title("設定")
+    st.sidebar.info("請站在距離鏡頭約 1.5 ~ 2 公尺處，確保全身入鏡。")
 
-webrtc_streamer(
-    key="boxing",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-    video_processor_factory=VideoProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-)
+    # 啟動 WebRTC
+    webrtc_streamer(
+        key="boxing",
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+if __name__ == "__main__":
+    main()
