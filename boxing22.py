@@ -5,33 +5,22 @@ import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import time
 import random
-
-# ==========================================
-# 核心修復部分：MediaPipe 引用方式
-# ==========================================
-# 在 Streamlit Cloud (Python 3.11/3.13) 上，直接呼叫 mp.solutions.pose 有時會失效
-# 因此我們這裡使用 "from ... import ..." 的顯式寫法來繞過這個問題
-try:
-    import mediapipe as mp
-    from mediapipe.python.solutions import pose as mp_pose
-    from mediapipe.python.solutions import drawing_utils as mp_drawing
-except ImportError:
-    st.error("無法匯入 MediaPipe，請確認 requirements.txt 包含 mediapipe 和 protobuf==3.20.3")
+import mediapipe as mp  # <--- 回歸標準寫法
 
 # ==========================================
 # 拳擊分析邏輯 (Logic Class)
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
-        # 使用上面顯式引用的模組，而不是 mp.solutions.pose
-        self.mp_pose = mp_pose
-        self.mp_drawing = mp_drawing
+        # 因為環境已經修復，我們使用標準的 MediaPipe 呼叫方式
+        self.mp_pose = mp.solutions.pose
+        self.mp_drawing = mp.solutions.drawing_utils
         
         # 初始化 Pose 模型
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
-            model_complexity=1  # 0=Lite, 1=Full, 2=Heavy (建議 1 平衡速度與準確度)
+            model_complexity=1
         )
         
         # 遊戲狀態變數
@@ -69,8 +58,7 @@ class BoxingAnalystLogic:
             )
             
             # -------------------------------------------------------
-            # 這裡您可以放入您原本的偵測邏輯
-            # 以下是一個簡單的範例：偵測出拳 (手腕超過手肘)
+            # 遊戲邏輯
             # -------------------------------------------------------
             
             # 取得左手座標
@@ -81,7 +69,7 @@ class BoxingAnalystLogic:
             right_wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST.value]
             right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW.value]
 
-            # 簡單的邏輯：隨機出題
+            # 隨機出題
             current_time = time.time()
             
             # 如果目前沒有目標，每隔幾秒生成一個新目標
@@ -93,24 +81,21 @@ class BoxingAnalystLogic:
             # 顯示指令
             if self.target:
                 color = (0, 0, 255) if self.target == 'LEFT' else (255, 0, 0)
-                cv2.putText(image, f"PUNCH {self.target}!", (50, 100), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4, cv2.LINE_AA)
+                text = f"PUNCH {self.target}!"
+                # 文字外框(黑色)以增加對比度
+                cv2.putText(image, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 8, cv2.LINE_AA)
+                # 文字本體
+                cv2.putText(image, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4, cv2.LINE_AA)
 
-            # 偵測動作是否完成 (簡單判斷：手腕 X 軸大幅移動或 Y 軸高於鼻子等，這裡示範 X 軸伸展)
-            # 注意：MediaPipe 座標是歸一化的 (0~1)
-            
             action_detected = None
             
-            # 簡單判斷：如果手腕非常接近相機 (z 軸) 或 手伸直
-            # 這裡用一個簡單的視覺判斷：手腕比手肘更遠離身體中心
-            # (這只是一個範例邏輯，請替換回您原本的判定代碼)
-            
-            # 假設：當左手腕的 x < 左手肘 x (畫面左邊) -> 左拳
-            if left_wrist.x < left_elbow.x - 0.1:
+            # 簡單判斷：手腕比手肘更遠離身體中心 (X軸判斷)
+            # 左手向左伸展
+            if left_wrist.x < left_elbow.x - 0.05: 
                 action_detected = 'LEFT'
             
-            # 假設：當右手腕的 x > 右手肘 x (畫面右邊) -> 右拳
-            if right_wrist.x > right_elbow.x + 0.1:
+            # 右手向右伸展
+            if right_wrist.x > right_elbow.x + 0.05:
                 action_detected = 'RIGHT'
 
             # 檢查是否擊中目標
@@ -131,7 +116,7 @@ class BoxingAnalystLogic:
 
             if self.reaction_times:
                 avg_time = np.mean(self.reaction_times)
-                cv2.putText(image, f'Avg Time: {avg_time:.2f}s', (260, 60), 
+                cv2.putText(image, f'Avg: {avg_time:.2f}s', (260, 60), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
 
         return image
@@ -146,8 +131,15 @@ class VideoProcessor(VideoTransformerBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
+        # 翻轉影像 (鏡像效果)，讓操作更直覺
+        img = cv2.flip(img, 1)
+        
         # 交給邏輯層處理
         img = self.logic.process(img)
+        
+        # 再翻轉回來嗎？通常不需要，因為 webrtc 會直接顯示處理後的
+        # 但要注意左右手判斷邏輯是否受翻轉影響
+        # 這裡為了簡單，我們在 process 內部處理的是鏡像後的圖
         
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -158,10 +150,7 @@ def main():
     st.set_page_config(page_title="Boxing Reaction App", layout="wide")
     
     st.title("🥊 Boxing Reaction Trainer")
-    st.write("這是一個使用 MediaPipe 的拳擊反應測試。請允許瀏覽器存取攝影機。")
-
-    st.sidebar.title("設定")
-    st.sidebar.info("請站在距離鏡頭約 1.5 ~ 2 公尺處，確保全身入鏡。")
+    st.write("請允許瀏覽器存取攝影機。如果是第一次執行，可能需要等待幾秒鐘載入模型。")
 
     # 啟動 WebRTC
     webrtc_streamer(
