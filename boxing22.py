@@ -18,7 +18,7 @@ class BoxingAnalystLogic:
         self.mp_drawing_styles = mp.solutions.drawing_styles
         
         self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.5, # 降低一點門檻以提高偵測率
+            min_detection_confidence=0.5, 
             min_tracking_confidence=0.5,
             model_complexity=1
         )
@@ -29,9 +29,9 @@ class BoxingAnalystLogic:
         self.start_time = 0
         self.wait_until = 0
         
-        # 數據記錄 (初始值設為 '---')
-        self.last_reaction_time = 0.0
-        self.last_velocity = 0.0
+        # 數據記錄
+        self.last_reaction_time = 0.0 # 單位: ms
+        self.last_velocity = 0.0      # 單位: m/s
         self.last_hand = "None"
         
         # 速度計算
@@ -41,12 +41,17 @@ class BoxingAnalystLogic:
 
         # Debug: 記錄目前的伸展程度
         self.current_extension = 0.0
+        
+        # 設定判定門檻 (越小越容易觸發)
+        self.EXTENSION_THRESHOLD = 0.12 
+        # 設定最大顯示範圍 (用於繪製進度條比例)
+        self.MAX_EXTENSION_DISPLAY = 0.3
 
     def calculate_velocity(self, landmark, prev_landmark, scale, dt):
         if dt <= 0: return 0
         dx = landmark.x - prev_landmark.x
         dy = landmark.y - prev_landmark.y
-        dz = landmark.z - prev_landmark.z # 加入深度變化
+        dz = landmark.z - prev_landmark.z
         dist_px = np.sqrt(dx**2 + dy**2 + dz**2)
         return (dist_px * scale) / dt
 
@@ -54,7 +59,6 @@ class BoxingAnalystLogic:
         """ 繪製常駐儀表板 """
         # 1. 左下角半透明黑底
         overlay = image.copy()
-        # 確保黑框不會畫出界
         top_y = max(0, h - 180)
         cv2.rectangle(overlay, (10, top_y), (300, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
@@ -72,16 +76,19 @@ class BoxingAnalystLogic:
         
         cv2.putText(image, f"STATE: {status_text}", (20, h - 140), font, 0.7, (0, 255, 255), 2)
 
-        # 數據顯示 (如果有值就顯示數值，否則顯示 ---)
-        r_time_str = f"{self.last_reaction_time:.3f} s" if self.last_reaction_time > 0 else "---"
+        # 數據顯示 (轉為 ms 整數顯示)
+        if self.last_reaction_time > 0:
+            r_time_str = f"{int(self.last_reaction_time)} ms" 
+        else:
+            r_time_str = "---"
+            
         vel_str = f"{self.last_velocity:.1f} m/s" if self.last_velocity > 0 else "---"
         
-        cv2.putText(image, f"Time: {r_time_str}", (20, h - 100), font, 0.8, white, 2)
+        cv2.putText(image, f"Time: {r_time_str}", (20, h - 100), font, 0.9, white, 2)
         cv2.putText(image, f"Speed: {vel_str}", (20, h - 60), font, 0.8, white, 2)
         cv2.putText(image, f"Last: {self.last_hand}", (20, h - 25), font, 0.7, (200, 200, 200), 1)
 
-        # 3. 繪製伸展力度條 (Debug Bar) - 讓使用者知道系統有在看
-        # 畫在儀表板右邊
+        # 3. 繪製伸展力度條 (Extension Check)
         bar_x = 320
         bar_w = 200
         bar_h = 20
@@ -89,17 +96,25 @@ class BoxingAnalystLogic:
         
         # 外框
         cv2.rectangle(image, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255,255,255), 2)
-        # 閾值線 (紅線) - 代表 0.15 的距離
-        threshold_x = int(bar_x + (0.15 / 0.3) * bar_w) # 假設最大 0.3
+        
+        # 閾值線 (紅線) - 根據 0.12 計算位置
+        threshold_ratio = self.EXTENSION_THRESHOLD / self.MAX_EXTENSION_DISPLAY
+        threshold_x = int(bar_x + threshold_ratio * bar_w)
+        
+        # 畫紅線
         cv2.line(image, (threshold_x, bar_y - 5), (threshold_x, bar_y + bar_h + 5), (0,0,255), 2)
         
         # 填充條 (根據目前伸展程度)
-        fill_len = int((self.current_extension / 0.3) * bar_w)
+        fill_ratio = self.current_extension / self.MAX_EXTENSION_DISPLAY
+        fill_len = int(fill_ratio * bar_w)
         fill_len = max(0, min(fill_len, bar_w))
         
-        color = (0, 255, 0) if self.current_extension > 0.15 else (0, 255, 255)
+        # 顏色邏輯：超過閾值變綠色，否則黃色
+        color = (0, 255, 0) if self.current_extension > self.EXTENSION_THRESHOLD else (0, 255, 255)
         cv2.rectangle(image, (bar_x, bar_y), (bar_x + fill_len, bar_y + bar_h), color, -1)
-        cv2.putText(image, "Extension Check", (bar_x, bar_y - 10), font, 0.5, white, 1)
+        
+        # 文字標示
+        cv2.putText(image, "Reach Check", (bar_x, bar_y - 10), font, 0.5, white, 1)
 
     def process(self, image):
         image.flags.writeable = False
@@ -114,7 +129,7 @@ class BoxingAnalystLogic:
         dt = current_time - self.prev_time
         self.prev_time = current_time
 
-        # 繪製儀表板 (就算沒偵測到人也要畫)
+        # 繪製儀表板
         self.draw_dashboard(image, h, w)
 
         if results.pose_landmarks:
@@ -132,8 +147,8 @@ class BoxingAnalystLogic:
             left_wrist = landmarks[15]
             right_wrist = landmarks[16]
             
-            # 計算目前最大的「橫向伸展距離」(用來驅動 Debug Bar)
-            # 簡單計算：手腕與肩膀的 X 軸距離絕對值
+            # 計算目前的「橫向伸展距離」 (絕對值)
+            # 這決定了下方的綠色條有多長
             dist_l = abs(left_wrist.x - left_shoulder.x)
             dist_r = abs(right_wrist.x - right_shoulder.x)
             self.current_extension = max(dist_l, dist_r)
@@ -165,7 +180,6 @@ class BoxingAnalystLogic:
                     self.state = 'PRE_START'
                     self.wait_until = current_time + random.uniform(1.5, 3.0)
                 else:
-                    # 提示文字
                     cv2.putText(image, "RAISE HANDS", (int(w/2)-100, int(h/2)), 
                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
@@ -195,26 +209,24 @@ class BoxingAnalystLogic:
                 if elapsed > 2.0:
                     self.state = 'WAIT_GUARD'
 
-                # 出拳判定 (放寬標準)
+                # 出拳判定 (門檻已降至 0.12)
                 hit = False
                 hit_v = 0
                 
-                # 門檻值：0.15 (原本是 0.2，太難了)
-                THRESHOLD = 0.15
-                
                 if self.target == 'LEFT':
                     # 左手往左伸 (x 變小)
-                    if (left_wrist.x < left_shoulder.x - THRESHOLD):
+                    if (left_wrist.x < left_shoulder.x - self.EXTENSION_THRESHOLD):
                         hit = True
                         hit_v = left_v
                 else:
                     # 右手往右伸 (x 變大)
-                    if (right_wrist.x > right_shoulder.x + THRESHOLD):
+                    if (right_wrist.x > right_shoulder.x + self.EXTENSION_THRESHOLD):
                         hit = True
                         hit_v = right_v
                 
                 if hit:
-                    self.last_reaction_time = elapsed
+                    # 將秒轉換為毫秒 (ms)
+                    self.last_reaction_time = elapsed * 1000 
                     self.last_velocity = hit_v
                     self.last_hand = self.target
                     self.state = 'RESULT'
@@ -222,7 +234,7 @@ class BoxingAnalystLogic:
 
             # 4. 顯示結果
             elif self.state == 'RESULT':
-                # 這裡不需要額外畫圖了，因為 draw_dashboard 會一直負責顯示數據
+                # 數據已由 draw_dashboard 處理
                 if current_time > self.wait_until:
                     self.state = 'WAIT_GUARD'
 
@@ -248,26 +260,26 @@ class VideoProcessor(VideoTransformerBase):
 def main():
     st.set_page_config(page_title="拳擊反應訓練", layout="wide")
     
-    st.sidebar.title("🥊 拳擊反應 v3.0")
+    st.sidebar.title("🥊 拳擊反應 v4.0")
     st.sidebar.info(
         """
-        **如何看到數據？**
-        1. 左下角有黑色儀表板，應顯示 **Time: ---**。
-        2. 當您出拳時，觀察畫面下方的 **Extension Check (綠色條)**。
-        3. 當綠色條超過紅線，才會判定成功並顯示數據。
+        **數據說明:**
+        - **Time**: 反應時間，單位毫秒 (ms)。
+          - 頂尖選手: 100-200 ms
+          - 一般人: 250-300 ms
+        - **Speed**: 瞬間出拳速度 (m/s)。
         
-        **流程:**
-        1. 舉起雙手護臉 (State: HANDS UP -> WAIT)。
-        2. 看到 LEFT/RIGHT 指令。
-        3. 用力向兩側出拳！
+        **判定指示:**
+        - 觀察畫面下方的 **Reach Check (綠色條)**。
+        - 只要綠色條超過紅線 (門檻 0.12)，即判定擊中。
         """
     )
     
-    st.title("🥊 AI 拳擊數據版 (Dashboard)")
-    st.warning("請確保左下角的黑色數據框可見。如果沒看到，請重新整理網頁。")
+    st.title("🥊 AI 拳擊反應測試 (ms版)")
+    st.markdown("請舉起雙手護臉 (Hands Up) 開始測試。")
 
     webrtc_streamer(
-        key="boxing-reaction-v3",
+        key="boxing-reaction-v4",
         video_processor_factory=VideoProcessor,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
