@@ -8,14 +8,12 @@ import random
 import mediapipe as mp
 
 # ==========================================
-# 邏輯核心類別 - 極致敏銳與循環優化版
+# 邏輯核心類別 - 介面回歸與循環優化版
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
         self.mp_pose = mp.solutions.pose
         self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-        
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.5, 
             min_tracking_confidence=0.5,
@@ -37,11 +35,11 @@ class BoxingAnalystLogic:
         self.prev_time = 0
         self.SHOULDER_WIDTH_M = 0.45 
 
-        # === 核心門檻：極致敏感與手肘權重 ===
-        self.EXTENSION_THRESHOLD = 0.04      # 極致敏感：手腕稍微離開肩膀即觸發
-        self.RETRACTION_THRESHOLD = 0.18     # 歸位判定
-        self.ELBOW_LIFT_THRESHOLD = 0.55     # 極大手肘權重：手肘稍微抬起即算有效
-        self.ARM_ANGLE_THRESHOLD = 90        # 只要手臂成直角以上即視為攻擊
+        # === 極致門檻設定 ===
+        self.EXTENSION_THRESHOLD = 0.04      
+        self.RETRACTION_THRESHOLD = 0.18     
+        self.ELBOW_LIFT_THRESHOLD = 0.55     
+        self.ARM_ANGLE_THRESHOLD = 90        
 
     def calculate_angle(self, a, b, c):
         a = np.array([a.x, a.y]); b = np.array([b.x, b.y]); c = np.array([c.x, c.y])
@@ -54,16 +52,48 @@ class BoxingAnalystLogic:
         dist_px = np.sqrt((landmark.x - prev_landmark.x)**2 + (landmark.y - prev_landmark.y)**2)
         return (dist_px * scale) / dt
 
+    def draw_dashboard(self, image, h, w):
+        """ 恢復左下角儀表板介面 """
+        overlay = image.copy()
+        # 繪製半透明黑框
+        cv2.rectangle(overlay, (10, h - 160), (320, h - 10), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        white = (255, 255, 255)
+        
+        # 狀態顯示
+        status_map = {
+            'WAIT_GUARD': ("RESET: HANDS UP", (0, 165, 255)),
+            'STIMULUS': ("GO !!!", (0, 0, 255)),
+            'RESULT': ("HIT!", (0, 255, 0)),
+            'PRE_START': ("READY...", (0, 255, 255))
+        }
+        status_text, color = status_map.get(self.state, ("IDLE", white))
+        cv2.putText(image, status_text, (20, h - 120), font, 0.8, color, 2)
+
+        # 數據顯示
+        r_time = f"{int(self.last_reaction_time)} ms" if self.last_reaction_time > 0 else "---"
+        v_speed = f"{self.last_velocity:.1f} m/s" if self.last_velocity > 0 else "---"
+        
+        cv2.putText(image, f"Time: {r_time}", (20, h - 85), font, 0.9, white, 2)
+        cv2.putText(image, f"Speed: {v_speed}", (20, h - 50), font, 0.8, white, 2)
+        
+        if self.state == 'RESULT':
+            cv2.putText(image, f"By: {self.trigger_reason}", (20, h - 20), font, 0.5, (200, 200, 200), 1)
+
     def process(self, image):
         image.flags.writeable = False
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         results = self.pose.process(image_rgb)
         image.flags.writeable = True
         image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        h, w, c = image.shape
+        h, w, _ = image.shape
         current_time = time.time()
         dt = current_time - self.prev_time
         self.prev_time = current_time
+
+        self.draw_dashboard(image, h, w)
 
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
@@ -76,7 +106,6 @@ class BoxingAnalystLogic:
             dist_l, dist_r = abs(l_wr.x - l_sh.x), abs(r_wr.x - r_sh.x)
             angle_l, angle_r = self.calculate_angle(l_sh, l_el, l_wr), self.calculate_angle(r_sh, r_el, r_wr)
 
-            # 速度計算
             sh_dist = np.sqrt((l_sh.x - r_sh.x)**2 + (l_sh.y - r_sh.y)**2)
             scale = self.SHOULDER_WIDTH_M / sh_dist if sh_dist > 0 else 0
             curr_v = 0
@@ -86,20 +115,14 @@ class BoxingAnalystLogic:
                 curr_v = max(l_v, r_v)
             self.prev_landmarks = landmarks
 
-            # ==========================
-            # 狀態機循環邏輯
-            # ==========================
-            
-            # 1. 預備狀態 (WAIT_GUARD)
+            # === 狀態機控制 ===
             if self.state == 'WAIT_GUARD':
-                is_ready = (dist_l < self.RETRACTION_THRESHOLD) and (dist_r < self.RETRACTION_THRESHOLD)
-                if is_ready:
+                if (dist_l < self.RETRACTION_THRESHOLD) and (dist_r < self.RETRACTION_THRESHOLD):
                     self.state = 'PRE_START'
                     self.wait_until = current_time + random.uniform(1.5, 3.0)
                 else:
-                    cv2.putText(image, "READY: HANDS UP", (int(w/2)-150, h-50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    cv2.putText(image, "BRING HANDS BACK", (int(w/2)-180, h-50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-            # 延遲隨機時間 (PRE_START)
             elif self.state == 'PRE_START':
                 if current_time > self.wait_until:
                     self.state = 'STIMULUS'
@@ -107,40 +130,38 @@ class BoxingAnalystLogic:
                     self.start_time = current_time
                     self.max_v_temp = 0.0
 
-            # 2. 要求出拳 (STIMULUS) - 限制 0.5 秒高亮，但持續監測
             elif self.state == 'STIMULUS':
                 elapsed = current_time - self.start_time
                 self.max_v_temp = max(self.max_v_temp, curr_v)
 
-                # 指令顯示 (僅在 0.5 秒內顯示超大字體，增加壓迫感)
-                if elapsed < 0.5:
+                # 指令停留 0.5 秒
+                if elapsed <= 0.5:
                     color = (0, 0, 255) if self.target == 'LEFT' else (255, 0, 0)
                     cv2.putText(image, f"{self.target}!", (int(w/2)-120, int(h/2)), cv2.FONT_HERSHEY_SIMPLEX, 5, color, 10)
 
-                # 判定邏輯
+                # 判定邏輯 (隨時監測)
                 t_dist = dist_l if self.target == 'LEFT' else dist_r
                 t_angle = angle_l if self.target == 'LEFT' else angle_r
                 t_el_y, t_sh_y = (l_el.y, l_sh.y) if self.target == 'LEFT' else (r_el.y, r_sh.y)
 
                 hit, reason = False, ""
-                if t_dist > self.EXTENSION_THRESHOLD: hit, reason = True, "Fast Reach"
-                elif t_angle > self.ARM_ANGLE_THRESHOLD: hit, reason = True, "Quick Straight"
-                elif t_el_y < (t_sh_y + self.ELBOW_LIFT_THRESHOLD): hit, reason = True, "Elbow Power"
+                if t_dist > self.EXTENSION_THRESHOLD: hit, reason = True, "Reach"
+                elif t_angle > self.ARM_ANGLE_THRESHOLD: hit, reason = True, "Straight"
+                elif t_el_y < (t_sh_y + self.ELBOW_LIFT_THRESHOLD): hit, reason = True, "Elbow Lift"
 
                 if hit:
                     self.last_reaction_time = elapsed * 1000
                     self.last_velocity = self.max_v_temp
                     self.trigger_reason = reason
                     self.state = 'RESULT'
-                    self.wait_until = current_time + 2.0 # 3. 結果呈現 2 秒
+                    self.wait_until = current_time + 2.0 # 結果呈現 2 秒
 
-                if elapsed > 2.0: # 超過兩秒未出拳自動重置
+                if elapsed > 3.0: # 超時重置
                     self.state = 'WAIT_GUARD'
 
-            # 3. 結果呈現 (RESULT)
             elif self.state == 'RESULT':
-                cv2.putText(image, "HIT!", (int(w/2)-80, int(h/2)-50), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 6)
-                cv2.putText(image, f"{int(self.last_reaction_time)}ms", (int(w/2)-80, int(h/2)+50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
+                # 在結果階段持續顯示數據
+                cv2.putText(image, "PERFECT!", (int(w/2)-120, int(h/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 6)
                 if current_time > self.wait_until:
                     self.state = 'WAIT_GUARD'
 
@@ -153,10 +174,9 @@ class VideoProcessor(VideoTransformerBase):
         return av.VideoFrame.from_ndarray(self.logic.process(img), format="bgr24")
 
 def main():
-    st.set_page_config(page_title="拳擊反應 v10 (極速靈敏版)", layout="wide")
-    st.title("🥊 AI 拳擊反應訓練 v10.0")
-    st.sidebar.info("順序：預備 -> 指令(0.5s) -> 結果(2s) -> 重複")
-    webrtc_streamer(key="boxing-v10", video_processor_factory=VideoProcessor, 
+    st.set_page_config(page_title="拳擊反應訓練 v11", layout="wide")
+    st.title("🥊 AI 拳擊訓練 (指令 0.5s / 結果 2s)")
+    webrtc_streamer(key="boxing-v11", video_processor_factory=VideoProcessor, 
                     media_stream_constraints={"video": True, "audio": False}, async_processing=True)
 
 if __name__ == "__main__": main()
