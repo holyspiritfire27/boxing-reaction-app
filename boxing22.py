@@ -8,7 +8,7 @@ import random
 import mediapipe as mp
 
 # ==========================================
-# 邏輯核心類別 - 指令強制停留與統計版
+# 邏輯核心類別 - 完整狀態機優化版
 # ==========================================
 class BoxingAnalystLogic:
     def __init__(self):
@@ -24,7 +24,7 @@ class BoxingAnalystLogic:
         self.target = None
         self.start_time = 0
         self.wait_until = 0
-        self.command_display_until = 0  # 👈 新增：指令最少顯示到的時間點
+        self.command_display_until = 0  # 指令最少顯示到的時間點
         
         # 數據記錄
         self.last_reaction_time = 0.0
@@ -39,7 +39,7 @@ class BoxingAnalystLogic:
         self.prev_time = 0
         self.SHOULDER_WIDTH_M = 0.45 
 
-        # === 極致門檻設定 ===
+        # === 極致門檻設定 (敏感度提高 50%) ===
         self.EXTENSION_THRESHOLD = 0.04      
         self.RETRACTION_THRESHOLD = 0.18     
         self.ELBOW_LIFT_THRESHOLD = 0.55     
@@ -57,6 +57,7 @@ class BoxingAnalystLogic:
         return (dist_px * scale) / dt
 
     def draw_dashboard(self, image, h, w):
+        """ 繪製包含統計數據的儀表板 """
         overlay = image.copy()
         cv2.rectangle(overlay, (10, h - 210), (340, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
@@ -65,13 +66,13 @@ class BoxingAnalystLogic:
         white = (255, 255, 255)
         yellow = (0, 255, 255)
         
-        # 狀態顯示 (RESULT_PENDING 時畫面仍顯示 GO，維持視覺一致性)
+        # 狀態顯示
         status_map = {
             'WAIT_GUARD': ("RESET: HANDS UP", (0, 165, 255)),
+            'PRE_START': ("READY...", yellow),
             'STIMULUS': ("GO !!!", (0, 0, 255)),
             'RESULT_PENDING': ("GO !!!", (0, 0, 255)),
-            'RESULT': ("HIT!", (0, 255, 0)),
-            'PRE_START': ("READY...", yellow)
+            'RESULT': ("HIT!", (0, 255, 0))
         }
         status_text, color = status_map.get(self.state, ("IDLE", white))
         cv2.putText(image, status_text, (20, h - 175), font, 0.7, color, 2)
@@ -103,6 +104,7 @@ class BoxingAnalystLogic:
             landmarks = results.pose_landmarks.landmark
             self.mp_drawing.draw_landmarks(image, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
+            # 取得關鍵點
             l_sh, r_sh = landmarks[11], landmarks[12]
             l_el, r_el = landmarks[13], landmarks[14]
             l_wr, r_wr = landmarks[15], landmarks[16]
@@ -110,6 +112,7 @@ class BoxingAnalystLogic:
             dist_l, dist_r = abs(l_wr.x - l_sh.x), abs(r_wr.x - r_sh.x)
             angle_l, angle_r = self.calculate_angle(l_sh, l_el, l_wr), self.calculate_angle(r_sh, r_el, r_wr)
 
+            # 速度計算
             sh_dist = np.sqrt((l_sh.x - r_sh.x)**2 + (l_sh.y - r_sh.y)**2)
             scale = self.SHOULDER_WIDTH_M / sh_dist if sh_dist > 0 else 0
             curr_v = 0
@@ -119,7 +122,7 @@ class BoxingAnalystLogic:
                 curr_v = max(l_v, r_v)
             self.prev_landmarks = landmarks
 
-            # === 狀態機控制 ===
+            # --- 狀態機邏輯 ---
             if self.state == 'WAIT_GUARD':
                 if (dist_l < self.RETRACTION_THRESHOLD) and (dist_r < self.RETRACTION_THRESHOLD):
                     self.state = 'PRE_START'
@@ -132,10 +135,10 @@ class BoxingAnalystLogic:
                     self.state = 'STIMULUS'
                     self.target = random.choice(['LEFT', 'RIGHT'])
                     self.start_time = current_time
-                    self.command_display_until = current_time + 1.0 # 👈 強制指令顯示 1 秒
+                    self.command_display_until = current_time + 1.0 # 強制顯示 1 秒
                     self.max_v_temp = 0.0
 
-            # 綜合處理指令顯示 (不論是 STIMULUS 還是 RESULT_PENDING，只要時間未到就顯示)
+            # 指令顯示 (STIMULUS 或 RESULT_PENDING 狀態下只要時間未到就顯示)
             if self.state in ['STIMULUS', 'RESULT_PENDING']:
                 if current_time <= self.command_display_until:
                     color = (0, 0, 255) if self.target == 'LEFT' else (255, 0, 0)
@@ -145,7 +148,6 @@ class BoxingAnalystLogic:
                 elapsed = current_time - self.start_time
                 self.max_v_temp = max(self.max_v_temp, curr_v)
 
-                # 判定邏輯
                 t_dist = dist_l if self.target == 'LEFT' else dist_r
                 t_angle = angle_l if self.target == 'LEFT' else angle_r
                 t_el_y, t_sh_y = (l_el.y, l_sh.y) if self.target == 'LEFT' else (r_el.y, r_sh.y)
@@ -162,7 +164,6 @@ class BoxingAnalystLogic:
                     if self.last_velocity > self.record_max_speed:
                         self.record_max_speed = self.last_velocity
                     
-                    # 👈 關鍵：切換到等待顯示結束的狀態
                     self.state = 'RESULT_PENDING'
                     self.wait_until = self.command_display_until
 
@@ -170,16 +171,51 @@ class BoxingAnalystLogic:
                     self.state = 'WAIT_GUARD'
 
             elif self.state == 'RESULT_PENDING':
-                # 指令還在畫面上顯示，等待 1 秒時間到
                 if current_time > self.wait_until:
                     self.state = 'RESULT'
-                    self.wait_until = current_time + 2.0 # 切換到結果呈現 2 秒
+                    self.wait_until = current_time + 2.0
 
             elif self.state == 'RESULT':
-                # 這裡畫面乾淨，純顯示儀表板數據
                 if current_time > self.wait_until:
                     self.state = 'WAIT_GUARD'
 
         return image
 
-# ... (其餘 VideoProcessor 與 main 部分保持不變) ...
+# ==========================================
+# Streamlit 核心組件
+# ==========================================
+class VideoProcessor(VideoTransformerBase):
+    def __init__(self):
+        self.logic = BoxingAnalystLogic()
+
+    def recv(self, frame):
+        try:
+            img = frame.to_ndarray(format="bgr24")
+            img = cv2.flip(img, 1)
+            img = self.logic.process(img)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+        except Exception as e:
+            return frame
+
+def main():
+    st.set_page_config(page_title="拳擊反應訓練 v13", layout="wide")
+    st.title("🥊 AI 拳擊反應統計版 v13")
+    
+    # 側邊欄說明
+    st.sidebar.header("訓練參數")
+    st.sidebar.write("1. 指令強制維持：1.0 秒")
+    st.sidebar.write("2. 結果呈現冷卻：2.0 秒")
+    st.sidebar.write("3. 敏感度：極高 (0.04)")
+    
+    if st.sidebar.button("清除紀錄"):
+        st.rerun()
+
+    webrtc_streamer(
+        key="boxing-final",
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True
+    )
+
+if __name__ == "__main__":
+    main()
