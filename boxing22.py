@@ -24,9 +24,9 @@ class BoxingAnalystLogic:
         self.wait_until = 0
         self.command_display_until = 0
         
-        # 預備動作偵測計時器
+        # === 需求2: 第一次 1.0秒，之後 0.5秒 ===
+        self.is_first_run = True 
         self.guard_hold_start_time = None 
-        self.GUARD_HOLD_DURATION = 1.0 # 需保持預備姿勢 1 秒才開始
         
         # 數據統計
         self.last_reaction_time = 0.0
@@ -47,7 +47,7 @@ class BoxingAnalystLogic:
         self.MIN_VELOCITY_THRESHOLD = 2.0 
         self.Z_PUNCH_THRESHOLD = 0.2
         self.ARM_ANGLE_THRESHOLD = 110 
-        self.RETRACTION_THRESHOLD = 0.30 # 稍微放寬預備判定範圍
+        self.RETRACTION_THRESHOLD = 0.30 
         
         self.current_intensity = 0.0
         self.max_v_temp = 0.0
@@ -56,7 +56,6 @@ class BoxingAnalystLogic:
         # 字型設定
         self.font_path = "font.ttf" 
         try:
-            # 測試載入
             ImageFont.truetype(self.font_path, 20)
             self.use_chinese = True
         except:
@@ -65,19 +64,18 @@ class BoxingAnalystLogic:
     def put_chinese_text(self, img, text, pos, color, size=30, stroke_width=0, stroke_fill=(0,0,0)):
         """ 
         繪製中文文字，支援描邊 (stroke) 效果 
-        stroke_width: 邊框寬度 (大於0即開啟)
-        stroke_fill: 邊框顏色 (預設黑色)
+        注意: 傳入的 color 必須是 RGB 格式 (例如 (255, 0, 0) 是紅色)
         """
         if not self.use_chinese:
-            # OpenCV 原生不支援 stroke，這裡只做簡單的文字
-            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, size/30, color, 2)
+            # OpenCV 使用 BGR，這裡做個簡單轉換避免顏色錯亂
+            cv2_color = (color[2], color[1], color[0]) 
+            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, size/30, cv2_color, 2)
             return img
             
         img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(img_pil)
         font = ImageFont.truetype(self.font_path, size)
         
-        # 繪製文字 (含描邊)
         draw.text(pos, text, font=font, fill=color, stroke_width=stroke_width, stroke_fill=stroke_fill)
         
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
@@ -118,10 +116,12 @@ class BoxingAnalystLogic:
         display_ratio = self.max_v_temp / 13.0 if self.state == 'STIMULUS' else self.current_intensity
         fill_w = int(min(1.0, display_ratio) * bar_w)
         
-        if display_ratio < 0.5: color = (0, 255, 255)
-        else: color = (0, 0, 255)
+        if display_ratio < 0.5: color = (0, 255, 255) # RGB Cyan
+        else: color = (255, 0, 0) # RGB Red
 
-        cv2.rectangle(image, (start_x, start_y), (start_x + fill_w, start_y + bar_h), color, -1)
+        # OpenCV rectangle uses BGR
+        cv2_color = (color[2], color[1], color[0])
+        cv2.rectangle(image, (start_x, start_y), (start_x + fill_w, start_y + bar_h), cv2_color, -1)
         
         val_to_show = self.last_punch_speed if self.state == 'RESULT' else (self.max_v_temp if self.state == 'STIMULUS' else self.prev_velocity)
         txt = f"速度偵測: {val_to_show:.1f} m/s"
@@ -133,29 +133,30 @@ class BoxingAnalystLogic:
         cv2.rectangle(overlay, (10, h - 320), (450, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
         
-        # 狀態文字顯示邏輯
         status_text = "閒置"
-        status_color = (255, 255, 255)
+        status_color = (255, 255, 255) # RGB
 
         if self.state == 'WAIT_GUARD':
             if self.guard_hold_start_time is not None:
-                # 計算保持進度
                 elapsed = time.time() - self.guard_hold_start_time
-                progress = min(100, int((elapsed / self.GUARD_HOLD_DURATION) * 100))
+                # 根據是否為第一次，決定目標時間
+                target_duration = 1.0 if self.is_first_run else 0.5
+                
+                progress = min(100, int((elapsed / target_duration) * 100))
                 status_text = f"保持姿勢... {progress}%"
-                status_color = (0, 255, 255) # 黃色提示
+                status_color = (0, 255, 255) # Cyan
             else:
                 status_text = "請舉手護頭"
-                status_color = (0, 165, 255)
+                status_color = (0, 165, 255) # Orange-ish
         elif self.state == 'PRE_START':
             status_text = "預備..."
             status_color = (0, 255, 255)
         elif self.state in ['STIMULUS', 'RESULT_PENDING']:
             status_text = "開始 !!!"
-            status_color = (0, 0, 255)
+            status_color = (255, 50, 50) # Bright Red
         elif self.state == 'RESULT':
             status_text = "命中!"
-            status_color = (0, 255, 0)
+            status_color = (0, 255, 0) # Green
 
         image = self.put_chinese_text(image, status_text, (20, h - 280), status_color, 40)
 
@@ -227,23 +228,22 @@ class BoxingAnalystLogic:
             dist_r_2d = abs(r_wr.x - r_sh.x)
 
             if self.state == 'WAIT_GUARD':
-                # 判定是否在預備姿勢 (手腕靠近肩膀)
                 is_in_guard = (dist_l_2d < self.RETRACTION_THRESHOLD) and (dist_r_2d < self.RETRACTION_THRESHOLD)
                 
                 if is_in_guard:
                     if self.guard_hold_start_time is None:
-                        # 剛進入姿勢，開始計時
                         self.guard_hold_start_time = current_time
-                    elif (current_time - self.guard_hold_start_time) > self.GUARD_HOLD_DURATION:
-                        # 保持時間達標，進入下一個狀態
-                        self.state, self.wait_until = 'PRE_START', current_time + random.uniform(1.5, 3.0)
-                        self.guard_hold_start_time = None # 重置計時器
+                    else:
+                        # === 核心修改：判斷是否為首次測試 ===
+                        required_duration = 1.0 if self.is_first_run else 0.5
+                        
+                        if (current_time - self.guard_hold_start_time) > required_duration:
+                            self.state, self.wait_until = 'PRE_START', current_time + random.uniform(1.5, 3.0)
+                            self.guard_hold_start_time = None
+                            self.is_first_run = False # 首次成功後，關閉標記
                 else:
-                    # 姿勢跑掉，重置計時器
                     self.guard_hold_start_time = None
-                    # 畫面中央提示
-                    # 這裡不加描邊，保持簡單
-                    image = self.put_chinese_text(image, "請舉手!", (int(w/2)-80, h-100), (255, 255, 255), 50, stroke_width=3, stroke_fill=(0,0,0))
+                    image = self.put_chinese_text(image, "請舉手!", (int(w/2)-80, h-100), (255, 255, 255), 50, stroke_width=3)
 
             elif self.state == 'PRE_START':
                 if current_time > self.wait_until:
@@ -255,19 +255,19 @@ class BoxingAnalystLogic:
 
             if self.state in ['STIMULUS', 'RESULT_PENDING']:
                 if current_time <= self.command_display_until:
-                    color = (0, 0, 255) if self.target == 'LEFT' else (255, 0, 0)
+                    # === 需求1：顏色修改 (RGB) ===
+                    # 左拳: 亮青藍色 (Cyan) (0, 255, 255)
+                    # 右拳: 亮紅色 (Bright Red) (255, 50, 50)
+                    color = (0, 255, 255) if self.target == 'LEFT' else (255, 50, 50)
                     target_text = "左拳!" if self.target == 'LEFT' else "右拳!"
                     
-                    # === 需求1：加強視覺效果 (粗體 + 黑色邊框) ===
-                    # stroke_width=5 讓字體變粗且有邊框
-                    # stroke_fill=(0,0,0) 設定邊框為黑色
                     image = self.put_chinese_text(
                         image, 
                         target_text, 
                         (int(w/2)-120, int(h/2)-50), 
                         color, 
                         size=100, 
-                        stroke_width=6, 
+                        stroke_width=6, # 黑色邊框
                         stroke_fill=(0,0,0)
                     )
 
@@ -326,14 +326,14 @@ class VideoProcessor(VideoTransformerBase):
             return frame
 
 def main():
-    st.set_page_config(page_title="拳擊反應 v21 (視覺增強版)", layout="wide")
-    st.title("🥊 拳擊反應 - 視覺增強版")
-    st.sidebar.write("v21 修改內容：")
-    st.sidebar.write("1. 出拳提示強化：黑邊+粗體")
-    st.sidebar.write("2. 預備確認：需保持舉手 1 秒才開始")
+    st.set_page_config(page_title="拳擊反應 v22 (亮色優化版)", layout="wide")
+    st.title("🥊 拳擊反應 - 亮色優化版")
+    st.sidebar.write("v22 修改內容：")
+    st.sidebar.write("1. 顏色：左(亮藍) 右(亮紅) + 黑邊框")
+    st.sidebar.write("2. 流程：首次預備需 1.0秒，後續 0.5秒")
     
     webrtc_streamer(
-        key="boxing-v21-visual", 
+        key="boxing-v22-color", 
         video_processor_factory=VideoProcessor, 
         media_stream_constraints={
             "video": {
