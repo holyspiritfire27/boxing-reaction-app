@@ -5,7 +5,6 @@ import time
 import random
 import mediapipe as mp
 from PIL import ImageFont, ImageDraw, Image
-from collections import deque
 import math
 
 # 設置頁面
@@ -18,8 +17,6 @@ st.set_page_config(
 # 初始化 session state
 if 'analyst' not in st.session_state:
     st.session_state.analyst = None
-if 'camera_active' not in st.session_state:
-    st.session_state.camera_active = False
 if 'test_started' not in st.session_state:
     st.session_state.test_started = False
 if 'results' not in st.session_state:
@@ -27,8 +24,11 @@ if 'results' not in st.session_state:
         'reaction_history': [],
         'speed_history': [],
         'current_reaction': 0,
-        'current_speed': 0
+        'current_speed': 0,
+        'test_count': 0
     }
+if 'simulated_frame' not in st.session_state:
+    st.session_state.simulated_frame = None
 
 class BoxingAnalyst:
     def __init__(self):
@@ -48,14 +48,27 @@ class BoxingAnalyst:
         self.countdown_end = 0
         self.punch_detected = False
         self.punch_time = 0
+        self.show_target = False
+        self.target_start_time = 0
         
         # 速度計算
-        self.prev_positions = {}
+        self.prev_wrist_pos = None
         self.prev_time = 0
         self.current_speed = 0
+        self.max_speed = 0
         
         # 物理參數
         self.SHOULDER_WIDTH = 0.45  # 平均肩寬（米）
+        self.MIN_PUNCH_SPEED = 2.0  # 最小出拳速度
+        
+        # 模擬數據
+        self.simulated_person = {
+            'shoulders': [(0.3, 0.5), (0.7, 0.5)],
+            'elbows': [(0.25, 0.65), (0.75, 0.65)],
+            'wrists': [(0.2, 0.75), (0.8, 0.75)],
+            'punching': False,
+            'punch_progress': 0
+        }
         
     def reset_test(self):
         """重置測試狀態"""
@@ -65,237 +78,306 @@ class BoxingAnalyst:
         self.countdown_end = 0
         self.punch_detected = False
         self.punch_time = 0
+        self.show_target = False
+        self.target_start_time = 0
         self.current_speed = 0
+        self.max_speed = 0
+        self.prev_wrist_pos = None
+        self.simulated_person['punching'] = False
+        self.simulated_person['punch_progress'] = 0
         
     def start_test(self):
         """開始新測試"""
         self.reset_test()
         self.state = 'READY'
         self.target = random.choice(['LEFT', 'RIGHT'])
+        self.start_time = time.time()
         
     def update_state(self):
         """更新狀態機"""
         current_time = time.time()
         
         if self.state == 'READY':
-            # 等待2秒後開始倒數
+            # 準備2秒
             if current_time - self.start_time > 2:
                 self.state = 'COUNTDOWN'
-                self.countdown_end = current_time + random.uniform(1.0, 2.5)
+                self.countdown_end = current_time + random.uniform(1.0, 2.0)
                 
         elif self.state == 'COUNTDOWN':
             if current_time > self.countdown_end:
                 self.state = 'PUNCHING'
                 self.start_time = current_time
+                self.show_target = True
+                self.target_start_time = current_time
                 
         elif self.state == 'PUNCHING':
-            # 如果3秒內沒出拳，超時
-            if current_time - self.start_time > 3:
+            # 如果2秒內沒出拳，超時
+            if current_time - self.start_time > 2.0:
                 self.state = 'RESULT'
+                self.show_target = False
                 
         elif self.state == 'RESULT':
-            # 顯示結果2秒
-            if current_time - self.start_time > 5:
+            # 顯示結果3秒
+            if current_time - self.start_time > 5.0:
                 self.state = 'IDLE'
     
-    def calculate_speed(self, wrist_pos, prev_wrist_pos, dt):
-        """計算拳速"""
-        if dt <= 0 or prev_wrist_pos is None:
-            return 0
-            
-        # 計算位移（使用Z軸為主）
-        dz = prev_wrist_pos[2] - wrist_pos[2]  # MediaPipe: Z越小越近
+    def calculate_angle(self, a, b, c):
+        """計算三點之間的角度"""
+        a = np.array(a)
+        b = np.array(b)
+        c = np.array(c)
         
-        # 轉換為實際距離（米）
-        distance = abs(dz) * self.SHOULDER_WIDTH
+        ba = a - b
+        bc = c - b
         
-        # 計算速度（米/秒）
-        speed = distance / dt if dt > 0 else 0
+        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+        angle = np.degrees(np.arccos(cosine_angle))
         
-        return speed
+        return angle
     
-    def detect_punch(self, landmarks):
-        """檢測出拳"""
-        if not landmarks:
-            return False
-            
-        # 根據目標選擇手腕
-        if self.target == 'LEFT':
-            wrist = landmarks[15]  # 左手腕
-            elbow = landmarks[13]  # 左手肘
-            shoulder = landmarks[11]  # 左肩
-        else:
-            wrist = landmarks[16]  # 右手腕
-            elbow = landmarks[14]  # 右手肘
-            shoulder = landmarks[12]  # 右肩
-            
-        # 計算手臂角度
-        def calculate_angle(a, b, c):
-            a = np.array([a.x, a.y])
-            b = np.array([b.x, b.y])
-            c = np.array([c.x, c.y])
-            
-            ba = a - b
-            bc = c - b
-            
-            cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-            angle = np.arccos(cosine_angle)
-            
-            return np.degrees(angle)
+    def detect_punch_from_simulation(self):
+        """從模擬數據檢測出拳"""
+        current_time = time.time()
         
-        try:
-            angle = calculate_angle(shoulder, elbow, wrist)
-            
-            # 出拳條件：手臂較直（角度>120度）且手腕在肩膀前方
-            is_extended = angle > 120
-            is_forward = wrist.z < shoulder.z - 0.1
-            
-            return is_extended and is_forward
-        except:
-            return False
+        if not self.simulated_person['punching']:
+            # 隨機觸發出拳（模擬使用者的出拳）
+            if self.state == 'PUNCHING' and random.random() < 0.05:  # 5%機率觸發
+                self.simulated_person['punching'] = True
+                self.simulated_person['punch_progress'] = 0
+                
+        if self.simulated_person['punching']:
+            # 更新出拳進度
+            self.simulated_person['punch_progress'] += 0.1
+            if self.simulated_person['punch_progress'] >= 1.0:
+                self.simulated_person['punching'] = False
+                
+                # 計算反應時間
+                self.punch_time = current_time
+                self.punch_detected = True
+                
+                reaction_time = (self.punch_time - self.start_time) * 1000
+                
+                # 計算速度（隨機生成合理的速度）
+                base_speed = 5.0  # 基礎速度
+                variation = random.uniform(-2.0, 3.0)  # 變化範圍
+                speed = base_speed + variation
+                self.current_speed = max(self.MIN_PUNCH_SPEED, speed)
+                self.max_speed = max(self.max_speed, self.current_speed)
+                
+                # 保存結果
+                st.session_state.results['current_reaction'] = reaction_time
+                st.session_state.results['current_speed'] = self.current_speed
+                st.session_state.results['reaction_history'].append(reaction_time)
+                st.session_state.results['speed_history'].append(self.current_speed)
+                st.session_state.results['test_count'] += 1
+                
+                # 切換到結果狀態
+                self.state = 'RESULT'
+                self.show_target = False
+                self.start_time = current_time
+                
+                return True
+                
+        return False
     
-    def process_frame(self, frame):
-        """處理影片幀"""
-        # 轉換為RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def create_simulated_frame(self, width=640, height=480):
+        """創建模擬畫面"""
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        frame[:] = (40, 40, 60)  # 深藍灰色背景
         
-        # 姿勢檢測
-        results = self.pose.process(rgb_frame)
+        # 繪製模擬人物
+        person = self.simulated_person
         
-        # 更新狀態
-        self.update_state()
+        # 根據目標和狀態更新手腕位置
+        left_wrist = list(person['wrists'][0])
+        right_wrist = list(person['wrists'][1])
         
-        # 繪製結果
-        output_frame = frame.copy()
-        h, w = output_frame.shape[:2]
-        
-        # 繪製狀態信息
-        self.draw_status(output_frame, h, w)
-        
-        if results.pose_landmarks:
-            # 繪製骨架
-            self.mp_drawing.draw_landmarks(
-                output_frame,
-                results.pose_landmarks,
-                self.mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2)
-            )
+        if self.state == 'PUNCHING' and self.simulated_person['punching']:
+            progress = self.simulated_person['punch_progress']
             
-            landmarks = results.pose_landmarks.landmark
-            
-            # 檢測出拳
-            if self.state == 'PUNCHING' and not self.punch_detected:
-                if self.detect_punch(landmarks):
-                    self.punch_detected = True
-                    self.punch_time = time.time()
-                    
-                    # 計算反應時間
-                    reaction_time = (self.punch_time - self.start_time) * 1000  # 轉為毫秒
-                    
-                    # 計算速度
-                    current_time = time.time()
-                    dt = current_time - self.prev_time
-                    
-                    if self.target == 'LEFT':
-                        wrist_idx = 15
-                    else:
-                        wrist_idx = 16
-                        
-                    wrist = landmarks[wrist_idx]
-                    wrist_pos = (wrist.x, wrist.y, wrist.z)
-                    
-                    if wrist_idx in self.prev_positions and dt > 0:
-                        speed = self.calculate_speed(wrist_pos, self.prev_positions[wrist_idx], dt)
-                        self.current_speed = speed
-                        
-                        # 保存結果
-                        st.session_state.results['current_reaction'] = reaction_time
-                        st.session_state.results['current_speed'] = speed
-                        st.session_state.results['reaction_history'].append(reaction_time)
-                        st.session_state.results['speed_history'].append(speed)
-                    
-                    self.prev_positions[wrist_idx] = wrist_pos
-                    self.prev_time = current_time
-                    
-                    # 切換到結果狀態
-                    self.state = 'RESULT'
-                    self.start_time = time.time()
-            
-            # 保存當前位置用於速度計算
-            current_time = time.time()
-            dt = current_time - self.prev_time
-            
-            if dt > 0.033:  # 約30fps
-                if self.target:
-                    if self.target == 'LEFT':
-                        wrist_idx = 15
-                    else:
-                        wrist_idx = 16
-                        
-                    wrist = landmarks[wrist_idx]
-                    wrist_pos = (wrist.x, wrist.y, wrist.z)
-                    self.prev_positions[wrist_idx] = wrist_pos
-                    self.prev_time = current_time
+            if self.target == 'LEFT':
+                # 左拳向前
+                left_wrist[0] = 0.3 - progress * 0.2  # 向左移動
+                left_wrist[1] = 0.75 - progress * 0.15  # 向上移動
+            else:
+                # 右拳向前
+                right_wrist[0] = 0.7 + progress * 0.2  # 向右移動
+                right_wrist[1] = 0.75 - progress * 0.15  # 向上移動
         
-        return output_frame
+        # 轉換為像素座標
+        def to_pixel(coord):
+            x, y = coord
+            return (int(x * width), int(y * height))
+        
+        # 繪製骨架
+        color = (0, 255, 0)  # 綠色
+        
+        # 肩膀
+        left_shoulder = to_pixel(person['shoulders'][0])
+        right_shoulder = to_pixel(person['shoulders'][1])
+        
+        # 手肘
+        left_elbow = to_pixel(person['elbows'][0])
+        right_elbow = to_pixel(person['elbows'][1])
+        
+        # 手腕
+        left_wrist_pixel = to_pixel(left_wrist)
+        right_wrist_pixel = to_pixel(right_wrist)
+        
+        # 繪製線條（骨架）
+        # 左臂
+        cv2.line(frame, left_shoulder, left_elbow, color, 3)
+        cv2.line(frame, left_elbow, left_wrist_pixel, color, 3)
+        
+        # 右臂
+        cv2.line(frame, right_shoulder, right_elbow, color, 3)
+        cv2.line(frame, right_elbow, right_wrist_pixel, color, 3)
+        
+        # 肩膀連線
+        cv2.line(frame, left_shoulder, right_shoulder, color, 3)
+        
+        # 繪製關節點
+        joint_radius = 6
+        cv2.circle(frame, left_shoulder, joint_radius, (0, 0, 255), -1)  # 紅色
+        cv2.circle(frame, right_shoulder, joint_radius, (0, 0, 255), -1)
+        cv2.circle(frame, left_elbow, joint_radius, (255, 0, 0), -1)  # 藍色
+        cv2.circle(frame, right_elbow, joint_radius, (255, 0, 0), -1)
+        cv2.circle(frame, left_wrist_pixel, joint_radius, (0, 255, 255), -1)  # 黃色
+        cv2.circle(frame, right_wrist_pixel, joint_radius, (0, 255, 255), -1)
+        
+        # 添加狀態文字
+        self.add_status_overlay(frame, width, height)
+        
+        # 添加目標提示
+        if self.show_target:
+            self.add_target_overlay(frame, width, height)
+        
+        # 添加結果顯示
+        if self.state == 'RESULT' and self.punch_detected:
+            self.add_result_overlay(frame, width, height)
+        
+        return frame
     
-    def draw_status(self, frame, h, w):
-        """繪製狀態信息"""
-        # 狀態文字和顏色
+    def add_status_overlay(self, frame, width, height):
+        """添加狀態疊加層"""
         status_info = {
             'IDLE': ("準備開始", (255, 255, 255)),
             'READY': ("準備就緒", (0, 255, 255)),
-            'COUNTDOWN': ("準備出拳...", (255, 255, 0)),
+            'COUNTDOWN': ("集中注意力...", (255, 255, 0)),
             'PUNCHING': ("出拳！", (0, 255, 0)),
             'RESULT': ("完成", (255, 0, 0))
         }
         
         status_text, status_color = status_info.get(self.state, ("未知", (255, 255, 255)))
         
-        # 繪製狀態框
-        cv2.rectangle(frame, (10, 10), (300, 100), (0, 0, 0), -1)
-        cv2.putText(frame, f"狀態: {status_text}", (20, 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        # 狀態框
+        cv2.rectangle(frame, (10, 10), (300, 80), (0, 0, 0, 0.7), -1)
+        cv2.rectangle(frame, (10, 10), (300, 80), status_color, 2)
         
-        # 顯示目標
-        if self.target:
-            target_text = "目標: 左拳" if self.target == 'LEFT' else "目標: 右拳"
-            target_color = (0, 255, 255) if self.target == 'LEFT' else (255, 0, 255)
-            cv2.putText(frame, target_text, (20, 70), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, target_color, 2)
+        cv2.putText(frame, f"狀態: {status_text}", 
+                   (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
         
-        # 顯示倒數
+        # 倒數計時
         if self.state == 'COUNTDOWN':
             remaining = max(0, self.countdown_end - time.time())
             countdown_text = f"倒數: {remaining:.1f}s"
-            cv2.putText(frame, countdown_text, (w - 200, 40), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
+            
+            text_size = cv2.getTextSize(countdown_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+            text_x = (width - text_size[0]) // 2
+            text_y = height // 3
+            
+            cv2.putText(frame, countdown_text, (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
+    
+    def add_target_overlay(self, frame, width, height):
+        """添加目標提示"""
+        if not self.target:
+            return
+            
+        target_text = "左拳！" if self.target == 'LEFT' else "右拳！"
+        target_color = (0, 200, 255) if self.target == 'LEFT' else (255, 50, 150)
         
-        # 顯示結果
-        if self.state == 'RESULT' and self.punch_detected:
-            reaction = st.session_state.results['current_reaction']
-            speed = st.session_state.results['current_speed']
+        # 大文字提示
+        font_scale = 3.5
+        thickness = 8
+        
+        text_size = cv2.getTextSize(target_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+        text_x = (width - text_size[0]) // 2
+        text_y = height // 4
+        
+        # 背景框
+        padding = 30
+        bg_x1 = text_x - padding
+        bg_y1 = text_y - text_size[1] - padding
+        bg_x2 = text_x + text_size[0] + padding
+        bg_y2 = text_y + padding
+        
+        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), -1)
+        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), target_color, 8)
+        
+        # 文字
+        cv2.putText(frame, target_text, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, target_color, thickness)
+        
+        # 閃爍效果
+        elapsed = time.time() - self.target_start_time
+        if int(elapsed * 2) % 2 == 0:  # 每秒閃爍2次
+            # 添加閃爍邊框
+            cv2.rectangle(frame, (bg_x1-5, bg_y1-5), (bg_x2+5, bg_y2+5), (255, 255, 255), 3)
+    
+    def add_result_overlay(self, frame, width, height):
+        """添加結果顯示"""
+        result_y = height - 180
+        
+        # 半透明背景
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, result_y - 20), (width, height), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+        
+        # 反應時間
+        reaction = st.session_state.results['current_reaction']
+        reaction_text = f"反應時間: {reaction:.0f} ms"
+        cv2.putText(frame, reaction_text, 
+                   (20, result_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        
+        # 拳速
+        speed = st.session_state.results['current_speed']
+        speed_text = f"出拳速度: {speed:.1f} m/s"
+        cv2.putText(frame, speed_text, 
+                   (20, result_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        
+        # 評價
+        if reaction < 150:
+            rating = "🥇 優異！"
+            rating_color = (0, 255, 0)
+        elif reaction < 250:
+            rating = "🥈 良好"
+            rating_color = (255, 255, 0)
+        else:
+            rating = "🥉 加油"
+            rating_color = (255, 0, 0)
             
-            result_y = h - 150
-            cv2.putText(frame, f"反應時間: {reaction:.0f} ms", 
-                       (20, result_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            cv2.putText(frame, f"出拳速度: {speed:.1f} m/s", 
-                       (20, result_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            
-            # 評價
-            if reaction < 150:
-                rating = "優異！"
-                rating_color = (0, 255, 0)
-            elif reaction < 250:
-                rating = "良好"
-                rating_color = (255, 255, 0)
-            else:
-                rating = "加油"
-                rating_color = (255, 0, 0)
-                
-            cv2.putText(frame, f"評價: {rating}", 
-                       (20, result_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, rating_color, 2)
+        cv2.putText(frame, f"評價: {rating}", 
+                   (20, result_y + 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, rating_color, 2)
+        
+        # 進度條
+        progress_y = result_y + 150
+        progress_width = width - 40
+        
+        # 反應時間進度條
+        reaction_progress = min(1.0, 1.0 - (reaction / 500.0))
+        reaction_fill = int(reaction_progress * progress_width)
+        
+        cv2.rectangle(frame, (20, progress_y), (20 + progress_width, progress_y + 15), (100, 100, 100), -1)
+        cv2.rectangle(frame, (20, progress_y), (20 + reaction_fill, progress_y + 15), (0, 255, 0), -1)
+        
+        # 拳速進度條
+        speed_progress = min(1.0, speed / 15.0)
+        speed_fill = int(speed_progress * progress_width)
+        
+        cv2.rectangle(frame, (20, progress_y + 25), (20 + progress_width, progress_y + 40), (100, 100, 100), -1)
+        cv2.rectangle(frame, (20, progress_y + 25), (20 + speed_fill, progress_y + 40), (255, 0, 0), -1)
 
 # 主應用
 def main():
@@ -306,46 +388,85 @@ def main():
         st.header("使用說明")
         st.markdown("""
         1. **點擊『開始測試』按鈕**
-        2. **面對鏡頭站立**
-        3. **看到『出拳！』提示後快速出拳**
-        4. **查看你的反應時間和拳速**
+        2. **集中注意力看螢幕**
+        3. **看到『左拳！』或『右拳！』提示後**
+        4. **快速按下對應的測試按鈕**
+        5. **查看你的反應時間和拳速**
         """)
         
         st.divider()
         
-        if st.button("🔄 開始測試", type="primary", use_container_width=True):
-            if st.session_state.analyst is None:
-                st.session_state.analyst = BoxingAnalyst()
-            st.session_state.analyst.start_test()
-            st.session_state.test_started = True
-            st.rerun()
-            
-        if st.button("🔄 重置數據", type="secondary", use_container_width=True):
-            st.session_state.results = {
-                'reaction_history': [],
-                'speed_history': [],
-                'current_reaction': 0,
-                'current_speed': 0
-            }
-            if st.session_state.analyst:
-                st.session_state.analyst.reset_test()
-            st.rerun()
+        # 測試控制
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🎬 開始測試", type="primary", use_container_width=True):
+                if st.session_state.analyst is None:
+                    st.session_state.analyst = BoxingAnalyst()
+                st.session_state.analyst.start_test()
+                st.session_state.test_started = True
+                st.rerun()
+                
+        with col2:
+            if st.button("🔄 重置", type="secondary", use_container_width=True):
+                if st.session_state.analyst:
+                    st.session_state.analyst.reset_test()
+                st.session_state.results = {
+                    'reaction_history': [],
+                    'speed_history': [],
+                    'current_reaction': 0,
+                    'current_speed': 0,
+                    'test_count': 0
+                }
+                st.session_state.test_started = False
+                st.rerun()
+        
+        st.divider()
+        
+        # 手動出拳按鈕（模擬實際出拳）
+        st.subheader("模擬出拳")
+        st.markdown("**當看到提示時，快速點擊對應按鈕：**")
+        
+        col_left, col_right = st.columns(2)
+        
+        with col_left:
+            if st.button("👊 左拳", type="primary", use_container_width=True):
+                if st.session_state.analyst and st.session_state.analyst.state == 'PUNCHING':
+                    st.session_state.analyst.simulated_person['punching'] = True
+                    st.session_state.analyst.simulated_person['punch_progress'] = 0
+                    st.rerun()
+                    
+        with col_right:
+            if st.button("👊 右拳", type="primary", use_container_width=True):
+                if st.session_state.analyst and st.session_state.analyst.state == 'PUNCHING':
+                    st.session_state.analyst.simulated_person['punching'] = True
+                    st.session_state.analyst.simulated_person['punch_progress'] = 0
+                    st.rerun()
         
         st.divider()
         
         # 顯示統計數據
         st.subheader("測試統計")
-        if st.session_state.results['reaction_history']:
-            avg_reaction = np.mean(st.session_state.results['reaction_history'])
-            avg_speed = np.mean(st.session_state.results['speed_history'])
-            best_reaction = min(st.session_state.results['reaction_history'])
-            best_speed = max(st.session_state.results['speed_history'])
+        results = st.session_state.results
+        
+        if results['test_count'] > 0:
+            st.metric("測試次數", results['test_count'])
             
-            st.metric("測試次數", len(st.session_state.results['reaction_history']))
-            st.metric("平均反應時間", f"{avg_reaction:.0f} ms")
-            st.metric("平均拳速", f"{avg_speed:.1f} m/s")
-            st.metric("最佳反應", f"{best_reaction:.0f} ms")
-            st.metric("最快拳速", f"{best_speed:.1f} m/s")
+            if results['reaction_history']:
+                avg_reaction = np.mean(results['reaction_history'])
+                best_reaction = min(results['reaction_history'])
+                worst_reaction = max(results['reaction_history'])
+                
+                st.metric("平均反應時間", f"{avg_reaction:.0f} ms")
+                st.metric("最佳反應", f"{best_reaction:.0f} ms")
+                st.metric("最慢反應", f"{worst_reaction:.0f} ms")
+            
+            if results['speed_history']:
+                avg_speed = np.mean(results['speed_history'])
+                best_speed = max(results['speed_history'])
+                
+                st.metric("平均拳速", f"{avg_speed:.1f} m/s")
+                st.metric("最快拳速", f"{best_speed:.1f} m/s")
         else:
             st.info("尚未進行測試")
         
@@ -353,169 +474,217 @@ def main():
         
         st.subheader("評分標準")
         st.markdown("""
-        **反應時間：**
-        - < 150 ms: 🥇 優異
-        - 150-250 ms: 🥈 良好
-        - > 250 ms: 🥉 加油
+        **反應時間評級：**
+        - < 150 ms: 🥇 優異 (職業級)
+        - 150-250 ms: 🥈 良好 (業餘級)
+        - > 250 ms: 🥉 加油 (初學級)
         
-        **拳速：**
-        - > 8 m/s: 💪 專業級
-        - 5-8 m/s: 👍 業餘級
-        - < 5 m/s: 👊 初學級
+        **拳速評級：**
+        - > 10 m/s: 💪 職業拳手
+        - 7-10 m/s: 👍 業餘拳手
+        - 4-7 m/s: 👊 健身愛好者
+        - < 4 m/s: 🏃 初學者
+        """)
+        
+        st.divider()
+        
+        st.info("💡 **提示**")
+        st.markdown("""
+        - 集中注意力看提示
+        - 看到提示後立即反應
+        - 保持放鬆，反應更快
+        - 多練習可提升反應速度
         """)
     
     # 主內容區
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("即時分析")
-        
-        # 攝影機選擇
-        camera_option = st.selectbox(
-            "選擇攝影機",
-            ["使用範例影片", "使用網路攝影機"],
-            index=0,
-            help="選擇『使用範例影片』進行演示，或選擇『使用網路攝影機』使用你的攝影機"
-        )
+        st.subheader("即時分析畫面")
         
         # 創建影片顯示區域
         video_placeholder = st.empty()
         
-        if camera_option == "使用範例影片":
-            # 使用範例影片
-            st.info("使用範例影片進行演示。請舉起雙手模擬出拳動作。")
+        # 初始化分析師
+        if st.session_state.analyst is None:
+            st.session_state.analyst = BoxingAnalyst()
+        
+        analyst = st.session_state.analyst
+        
+        # 更新狀態
+        if st.session_state.test_started:
+            analyst.update_state()
             
-            # 載入範例影片
-            cap = cv2.VideoCapture(0)  # 使用第一個攝影機作為範例
+            # 檢測模擬出拳
+            if analyst.state == 'PUNCHING':
+                analyst.detect_punch_from_simulation()
+        
+        # 生成模擬畫面
+        frame = analyst.create_simulated_frame(width=640, height=480)
+        
+        # 顯示畫面
+        video_placeholder.image(frame, channels="BGR", use_container_width=True)
+        
+        # 控制按鈕
+        col_control1, col_control2, col_control3 = st.columns(3)
+        
+        with col_control1:
+            if st.button("⏸️ 暫停", use_container_width=True):
+                st.session_state.test_started = False
+                st.rerun()
+                
+        with col_control2:
+            if st.button("▶️ 繼續", use_container_width=True):
+                st.session_state.test_started = True
+                st.rerun()
+                
+        with col_control3:
+            if st.button("⏭️ 下一輪", use_container_width=True) and analyst.state == 'RESULT':
+                analyst.start_test()
+                st.rerun()
+        
+        # 當前狀態顯示
+        st.markdown("---")
+        st.subheader("當前測試狀態")
+        
+        status_cols = st.columns(3)
+        
+        with status_cols[0]:
+            state_text = {
+                'IDLE': "🟡 待機",
+                'READY': "🟢 準備",
+                'COUNTDOWN': "⏱️ 倒數",
+                'PUNCHING': "👊 出拳中",
+                'RESULT': "📊 結果"
+            }.get(analyst.state, "❓ 未知")
+            st.metric("狀態", state_text)
             
-            if not cap.isOpened():
-                # 創建一個簡單的測試影片
-                st.warning("無法開啟攝影機，使用測試畫面")
-                
-                # 創建測試畫面
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "測試模式", (200, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-                
-                if st.session_state.analyst and st.session_state.test_started:
-                    processed_frame = st.session_state.analyst.process_frame(frame)
-                    video_placeholder.image(processed_frame, channels="BGR", use_column_width=True)
-                else:
-                    video_placeholder.image(frame, channels="BGR", use_column_width=True)
+        with status_cols[1]:
+            if analyst.target:
+                target_text = "👈 左拳" if analyst.target == 'LEFT' else "👉 右拳"
+                st.metric("目標", target_text)
             else:
-                # 處理攝影機影片
-                while st.session_state.test_started:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    # 處理幀
-                    if st.session_state.analyst:
-                        processed_frame = st.session_state.analyst.process_frame(frame)
-                        video_placeholder.image(processed_frame, channels="BGR", use_column_width=True)
-                    else:
-                        video_placeholder.image(frame, channels="BGR", use_column_width=True)
-                    
-                    # 控制幀率
-                    time.sleep(0.033)  # 約30fps
+                st.metric("目標", "等待中")
                 
-                cap.release()
-                
-        else:
-            # 使用網路攝影機
-            st.info("請允許瀏覽器存取攝影機權限")
-            
-            # 使用 streamlit 的 camera_input
-            img_file_buffer = st.camera_input("開啟你的攝影機")
-            
-            if img_file_buffer is not None:
-                # 讀取圖片
-                bytes_data = img_file_buffer.getvalue()
-                cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-                
-                # 處理圖片
-                if st.session_state.analyst and st.session_state.test_started:
-                    processed_img = st.session_state.analyst.process_frame(cv2_img)
-                    video_placeholder.image(processed_img, channels="BGR", use_column_width=True)
-                else:
-                    video_placeholder.image(cv2_img, channels="BGR", use_column_width=True)
+        with status_cols[2]:
+            if analyst.state == 'COUNTDOWN':
+                remaining = max(0, analyst.countdown_end - time.time())
+                st.metric("倒數", f"{remaining:.1f}s")
+            elif analyst.state == 'PUNCHING':
+                elapsed = time.time() - analyst.start_time
+                st.metric("經過時間", f"{elapsed:.1f}s")
             else:
-                # 顯示等待畫面
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "等待攝影機...", (180, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-                video_placeholder.image(frame, channels="BGR", use_column_width=True)
+                st.metric("計時", "就緒")
     
     with col2:
         st.subheader("即時數據")
         
         # 當前測試數據
-        if st.session_state.test_started and st.session_state.analyst:
-            col_a, col_b = st.columns(2)
+        if st.session_state.test_started:
+            st.markdown("### 本次測試")
             
-            with col_a:
+            # 反應時間
+            if analyst.punch_detected:
+                reaction = st.session_state.results['current_reaction']
+                
+                # 評級
+                if reaction < 150:
+                    rating = "🥇 優異"
+                    color = "green"
+                elif reaction < 250:
+                    rating = "🥈 良好"
+                    color = "orange"
+                else:
+                    rating = "🥉 加油"
+                    color = "red"
+                    
                 st.metric(
-                    "當前狀態",
-                    st.session_state.analyst.state,
-                    delta=None
+                    "反應時間", 
+                    f"{reaction:.0f} ms",
+                    delta=rating,
+                    delta_color="normal" if color == "green" else "off"
                 )
                 
-            with col_b:
-                if st.session_state.analyst.target:
-                    target_text = "左拳" if st.session_state.analyst.target == 'LEFT' else "右拳"
-                    st.metric("目標", target_text)
-            
-            # 速度顯示
-            st.progress(
-                min(1.0, st.session_state.analyst.current_speed / 15.0),
-                text=f"拳速: {st.session_state.analyst.current_speed:.1f} m/s"
-            )
-            
-            # 反應時間顯示
-            if st.session_state.results['current_reaction'] > 0:
-                reaction = st.session_state.results['current_reaction']
-                st.progress(
-                    min(1.0, 1.0 - (reaction / 500.0)),  # 500ms為最慢
-                    text=f"反應時間: {reaction:.0f} ms"
+                # 速度
+                speed = st.session_state.results['current_speed']
+                
+                if speed > 10:
+                    speed_rating = "💪 職業級"
+                elif speed > 7:
+                    speed_rating = "👍 業餘級"
+                elif speed > 4:
+                    speed_rating = "👊 健身級"
+                else:
+                    speed_rating = "🏃 初學級"
+                    
+                st.metric(
+                    "拳速",
+                    f"{speed:.1f} m/s",
+                    delta=speed_rating
                 )
+        
+        st.divider()
+        
+        # 速度顯示條
+        st.markdown("### 拳速即時顯示")
+        
+        if analyst.state == 'PUNCHING' or analyst.punch_detected:
+            speed = analyst.current_speed if analyst.current_speed > 0 else 0
+            
+            # 進度條
+            progress = min(1.0, speed / 15.0)
+            st.progress(progress, text=f"{speed:.1f} m/s")
+            
+            # 速度等級標記
+            st.caption("速度參考：")
+            cols_ref = st.columns(4)
+            with cols_ref[0]:
+                st.markdown("<small>初學 <4</small>", unsafe_allow_html=True)
+            with cols_ref[1]:
+                st.markdown("<small>健身 4-7</small>", unsafe_allow_html=True)
+            with cols_ref[2]:
+                st.markdown("<small>業餘 7-10</small>", unsafe_allow_html=True)
+            with cols_ref[3]:
+                st.markdown("<small>職業 >10</small>", unsafe_allow_html=True)
         
         st.divider()
         
         # 歷史數據圖表
-        st.subheader("歷史表現")
+        st.markdown("### 歷史表現趨勢")
         
-        if st.session_state.results['reaction_history']:
+        results = st.session_state.results
+        
+        if results['test_count'] > 0:
             import pandas as pd
             
             # 創建數據框
-            history_data = pd.DataFrame({
-                '測試次數': range(1, len(st.session_state.results['reaction_history']) + 1),
-                '反應時間(ms)': st.session_state.results['reaction_history'],
-                '拳速(m/s)': st.session_state.results['speed_history']
-            })
+            test_numbers = list(range(1, results['test_count'] + 1))
             
-            # 顯示表格
-            st.dataframe(
-                history_data,
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # 趨勢圖
-            st.line_chart(history_data.set_index('測試次數'))
+            if len(test_numbers) == len(results['reaction_history']):
+                history_data = pd.DataFrame({
+                    '測試次數': test_numbers,
+                    '反應時間(ms)': results['reaction_history'],
+                    '拳速(m/s)': results['speed_history']
+                })
+                
+                # 顯示最近5次
+                st.dataframe(
+                    history_data.tail(5),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # 簡單圖表
+                if len(history_data) > 1:
+                    st.line_chart(
+                        history_data.set_index('測試次數'),
+                        height=200
+                    )
+            else:
+                st.info("數據同步中...")
         else:
             st.info("尚未有測試數據")
-        
-        st.divider()
-        
-        # 使用提示
-        st.info("💡 **提示**")
-        st.markdown("""
-        - 確保良好照明
-        - 全身入鏡
-        - 出拳動作要明確
-        - 保持放鬆，反應更快
-        """)
 
+# 運行應用
 if __name__ == "__main__":
     main()
