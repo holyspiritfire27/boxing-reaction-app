@@ -768,4 +768,6 @@ def main():
         st.write("- 出拳時動作明確")
 
 
-if __name
+if __name__ == "__main__":
+    main()
+
