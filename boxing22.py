@@ -201,7 +201,6 @@ class BoxingAnalystLogic:
                    l_position_ok and r_position_ok and symmetry_ok)
             
         except Exception as e:
-            print(f"檢查姿勢錯誤: {e}")
             return False
 
     def get_speed_rating(self, speed):
@@ -261,43 +260,50 @@ class BoxingAnalystLogic:
             color = (255, 50, 150)  # 粉紅色
             text = "右 拳 !"
         
-        # 計算文字位置（屏幕中央偏上，不擋住人）
+        # 計算文字位置（屏幕中央偏上）
         text_x = w // 2
-        text_y = h // 3  # 上方1/3處
+        text_y = h // 3
         
-        # 添加白色背景框（不透明）
-        text_size = 120
-        padding = 20
-        
-        # 計算文字邊界框
+        # 繪製文字背景（不透明白色）
         (text_width, text_height), baseline = cv2.getTextSize(
-            text, cv2.FONT_HERSHEY_SIMPLEX, text_size/30, 6)
+            text, cv2.FONT_HERSHEY_SIMPLEX, 3, 6)
         
-        bg_x1 = text_x - text_width//2 - padding
-        bg_y1 = text_y - text_height//2 - padding
-        bg_x2 = text_x + text_width//2 + padding
-        bg_y2 = text_y + text_height//2 + padding
+        bg_x1 = text_x - text_width//2 - 30
+        bg_y1 = text_y - text_height//2 - 20
+        bg_x2 = text_x + text_width//2 + 30
+        bg_y2 = text_y + text_height//2 + 20
         
-        # 繪製背景框
+        # 白色背景
         cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), -1)
-        cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), color, 6)
+        cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), color, 8)
         
-        # 繪製文字（使用中文函數）
-        image = self.put_chinese_text(image, text, 
-                                     (text_x - text_width//2, text_y + text_height//4), 
-                                     color, text_size, stroke_width=6, stroke_fill=(255, 255, 255))
+        # 繪製文字
+        if self.use_chinese:
+            # 使用中文字體
+            img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(img_pil)
+            font = ImageFont.truetype(self.font_path, 100)
+            
+            # 計算文字位置
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            
+            draw.text((text_x - text_width//2, text_y - text_height//2), 
+                     text, font=font, fill=color, stroke_width=6, stroke_fill=(0, 0, 0))
+            image = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        else:
+            # 使用英文字體
+            cv2.putText(image, text, (text_x - text_width//2, text_y + text_height//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 3, color, 6)
         
-        # 添加倒數計時（如果有的話）
+        # 添加倒數計時
         if self.command_display_until > 0:
             remaining = max(0, self.command_display_until - time.time())
-            countdown = f"{remaining:.1f}"
-            
-            countdown_size = 50
-            countdown_y = text_y + text_height//2 + 80
-            
-            image = self.put_chinese_text(image, countdown, 
-                                         (text_x - 50, countdown_y), 
-                                         (255, 255, 0), countdown_size, stroke_width=4)
+            if remaining < 1.0:
+                countdown = f"{remaining:.1f}"
+                cv2.putText(image, countdown, (text_x - 50, text_y + 150), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 0), 4)
         
         return image
 
@@ -313,8 +319,12 @@ class BoxingAnalystLogic:
         
         # 結果標題
         title_y = start_y + 50
-        image = self.put_chinese_text(image, "🏆 本次出拳數據", 
-                                     (20, title_y), (255, 255, 0), 32)
+        title = "🏆 本次出拳數據"
+        
+        if self.use_chinese:
+            image = self.put_chinese_text(image, title, (20, title_y), (255, 255, 0), 32)
+        else:
+            cv2.putText(image, title, (20, title_y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
         
         # 主要數據
         r_time_val = int(self.last_reaction_time)
@@ -327,42 +337,33 @@ class BoxingAnalystLogic:
         # 數據顯示
         data_start_y = title_y + 60
         
-        image = self.put_chinese_text(image, f"⚡ 反應時間: {r_time_val} ms", 
-                                     (30, data_start_y), (200, 255, 200), 26)
-        image = self.put_chinese_text(image, f"[{r_rating}]", 
-                                     (300, data_start_y), (255, 255, 0), 24)
-        
-        image = self.put_chinese_text(image, f"💨 出拳速度: {speed_val:.1f} m/s", 
-                                     (30, data_start_y + 50), (200, 255, 200), 26)
-        image = self.put_chinese_text(image, f"[{s_rating}]", 
-                                     (300, data_start_y + 50), (255, 200, 0), 24)
-        
-        image = self.put_chinese_text(image, f"🚀 峰值加速度: {acc_val:.0f} m/s²", 
-                                     (30, data_start_y + 100), (200, 255, 200), 26)
-        
-        # 分隔線
-        line_y = data_start_y + 140
-        cv2.line(image, (20, line_y), (w - 20, line_y), (100, 100, 100), 2)
-        
-        # 歷史平均
-        avg_y = line_y + 40
-        
-        if self.reaction_history:
-            avg_time = np.mean(self.reaction_history[-3:])
-            avg_speed = np.mean(self.speed_history[-3:])
-            avg_acc = np.mean(self.acc_history[-3:]) if self.acc_history else 0
+        if self.use_chinese:
+            image = self.put_chinese_text(image, f"⚡ 反應時間: {r_time_val} ms", 
+                                         (30, data_start_y), (200, 255, 200), 26)
+            image = self.put_chinese_text(image, f"[{r_rating}]", 
+                                         (300, data_start_y), (255, 255, 0), 24)
             
-            image = self.put_chinese_text(image, f"📊 最近3次平均:", 
-                                         (30, avg_y), (200, 200, 255), 24)
-            image = self.put_chinese_text(image, f"反應: {int(avg_time)} ms | 速度: {avg_speed:.1f} m/s | 加速度: {avg_acc:.0f} m/s²", 
-                                         (30, avg_y + 35), (200, 200, 255), 22)
+            image = self.put_chinese_text(image, f"💨 出拳速度: {speed_val:.1f} m/s", 
+                                         (30, data_start_y + 50), (200, 255, 200), 26)
+            image = self.put_chinese_text(image, f"[{s_rating}]", 
+                                         (300, data_start_y + 50), (255, 200, 0), 24)
+            
+            image = self.put_chinese_text(image, f"🚀 峰值加速度: {acc_val:.0f} m/s²", 
+                                         (30, data_start_y + 100), (200, 255, 200), 26)
+        else:
+            cv2.putText(image, f"Reaction: {r_time_val} ms [{r_rating}]", 
+                       (30, data_start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
+            cv2.putText(image, f"Speed: {speed_val:.1f} m/s [{s_rating}]", 
+                       (30, data_start_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
+            cv2.putText(image, f"Acceleration: {acc_val:.0f} m/s²", 
+                       (30, data_start_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
         
         return image
 
     def draw_speed_bar(self, image, h, w):
         """繪製速度條"""
         bar_w, bar_h = 300, 25
-        start_x, start_y = w - 320, h - 380  # 移到上方
+        start_x, start_y = w - 320, 80  # 移到右上方
         
         # 背景
         cv2.rectangle(image, (start_x, start_y), 
@@ -391,18 +392,23 @@ class BoxingAnalystLogic:
         # 繪製速度條
         cv2.rectangle(image, (start_x, start_y), 
                      (start_x + fill_w, start_y + bar_h), 
-                     (color[2], color[1], color[0]), -1)
+                     color, -1)
+        
+        # 邊框
+        cv2.rectangle(image, (start_x, start_y), 
+                     (start_x + bar_w, start_y + bar_h), 
+                     (200, 200, 200), 2)
         
         # 添加刻度
         for i in range(1, 5):
             x_pos = start_x + int(i * 0.2 * bar_w)
             cv2.line(image, (x_pos, start_y), 
-                    (x_pos, start_y + bar_h), (200, 200, 200), 1)
+                    (x_pos, start_y + bar_h), (100, 100, 100), 1)
         
         # 標籤
-        label_text = f"即時速度: {display_val:.1f} m/s"
-        image = self.put_chinese_text(image, label_text, 
-                                     (start_x, start_y - 30), (255, 255, 255), 20)
+        label_text = f"Speed: {display_val:.1f} m/s"
+        cv2.putText(image, label_text, (start_x, start_y - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         return image
 
@@ -413,20 +419,22 @@ class BoxingAnalystLogic:
         h, w, _ = image.shape
         current_time = time.time()
         
+        # 計算時間差
+        dt = current_time - self.prev_time if self.prev_time > 0 else 0.033
+        
         # 計算FPS
-        if self.prev_time > 0:
-            dt = current_time - self.prev_time
-            if dt > 0:
-                self.current_fps = 0.9 * self.current_fps + 0.1 * (1.0 / dt)
+        if dt > 0:
+            current_fps = 1.0 / dt
+            self.current_fps = 0.9 * self.current_fps + 0.1 * current_fps
         
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
             
-            # 繪製骨架（透明化）
+            # 繪製骨架
             self.mp_drawing.draw_landmarks(
                 image, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS,
-                self.mp_drawing.DrawingSpec(color=(0, 255, 0, 100), thickness=2, circle_radius=2),
-                self.mp_drawing.DrawingSpec(color=(255, 0, 0, 100), thickness=2, circle_radius=2)
+                self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                self.mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2)
             )
             
             # 計算比例尺
@@ -665,16 +673,16 @@ class VideoProcessor(VideoTransformerBase):
 
 
 def main():
-    st.set_page_config(page_title="拳擊反應分析 v25", layout="wide")
+    st.set_page_config(page_title="拳擊反應分析系統", layout="wide")
     st.title("🥊 拳擊反應分析系統 - 精準物理版")
     
     with st.sidebar:
-        st.header("🎯 版本特色")
-        st.success("**主要改進：**")
-        st.write("1. ✅ 強化預備姿勢檢測")
-        st.write("2. ✅ 防誤觸機制（避免手指微動觸發）")
-        st.write("3. ✅ 分層UI設計（提示在最前方）")
-        st.write("4. ✅ 精準速度計算（軌跡擬合）")
+        st.header("🎯 系統特色")
+        st.success("**主要功能：**")
+        st.write("✓ 強化預備姿勢檢測")
+        st.write("✓ 防誤觸機制")
+        st.write("✓ 分層UI設計")
+        st.write("✓ 精準速度計算")
         
         st.divider()
         
@@ -683,14 +691,12 @@ def main():
         st.write("2. 舉起雙手，拳頭放在臉頰兩側")
         st.write("3. 保持姿勢直到系統提示")
         st.write("4. 看到提示後快速出拳")
-        st.write("5. 系統會分析你的速度和反應時間")
+        st.write("5. 查看分析結果")
         
         st.divider()
         
-        if st.button("🔄 重置所有數據"):
-            st.cache_data.clear()
-            st.runtime.legacy_caching.clear_cache()
-            st.success("數據已重置！請重新整理頁面。")
+        if st.button("🔄 重新開始"):
+            st.experimental_rerun()
     
     # 主畫面
     col1, col2 = st.columns([3, 1])
@@ -698,62 +704,68 @@ def main():
     with col1:
         st.subheader("即時分析畫面")
         
-        # 系統狀態指示
-        status_container = st.empty()
-        
-        # 視訊串流
-        ctx = webrtc_streamer(
-            key="boxing-v25-precision",
-            video_processor_factory=VideoProcessor,
-            media_stream_constraints={
-                "video": {
-                    "frameRate": {"ideal": 60, "min": 45},
-                    "width": {"ideal": 1280, "min": 640},
-                    "height": {"ideal": 720, "min": 480}
-                },
-                "audio": False
+        # 創建一個更寬容的媒體約束
+        media_stream_constraints = {
+            "video": {
+                # 使用更寬容的設定
+                "width": {"ideal": 640, "min": 320},
+                "height": {"ideal": 480, "min": 240},
+                "frameRate": {"ideal": 30, "min": 15}
             },
+            "audio": False
+        }
+        
+        # 可選：允許使用者選擇攝影機
+        video_source = st.selectbox(
+            "選擇攝影機",
+            ["預設攝影機", "前置攝影機", "後置攝影機"],
+            index=0
+        )
+        
+        # 根據選擇調整約束
+        if video_source == "前置攝影機":
+            media_stream_constraints["video"]["facingMode"] = {"ideal": "user"}
+        elif video_source == "後置攝影機":
+            media_stream_constraints["video"]["facingMode"] = {"ideal": "environment"}
+        
+        ctx = webrtc_streamer(
+            key="boxing-analyzer",
+            video_processor_factory=VideoProcessor,
+            media_stream_constraints=media_stream_constraints,
             async_processing=True,
             rtc_configuration={
                 "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
             }
         )
+        
+        if not ctx.state.playing:
+            st.info("👆 請點擊上方「START」按鈕開始")
+            st.warning("如果遇到攝影機權限問題，請確保：")
+            st.write("1. 允許瀏覽器存取攝影機")
+            st.write("2. 沒有其他程式在使用攝影機")
+            st.write("3. 刷新頁面重試")
     
     with col2:
         st.subheader("📊 等級對照表")
         
         with st.expander("速度等級", expanded=True):
-            speed_data = {
+            st.table({
                 "等級": ["暖身", "初學者", "業餘", "專業", "選手", "世界級", "傳奇"],
                 "速度(m/s)": ["<4", "4-6", "6-8", "8-10", "10-13", "13-16", ">16"],
-            }
-            st.table(speed_data)
+            })
         
         with st.expander("反應時間", expanded=True):
-            reaction_data = {
+            st.table({
                 "等級": ["頂尖", "優異", "良好", "一般", "遲緩"],
                 "時間(ms)": ["<120", "120-150", "150-200", "200-300", ">300"],
-            }
-            st.table(reaction_data)
-        
-        with st.expander("🏆 世界紀錄參考"):
-            st.write("**最快拳擊手：**")
-            st.write("- 泰森：拳速約 15-18 m/s")
-            st.write("- 帕奎奧：拳速約 13-16 m/s")
-            st.write("- 一般職業：拳速約 8-12 m/s")
-            st.write("")
-            st.write("**最快反應：**")
-            st.write("- 頂尖選手：100-120 ms")
-            st.write("- 正常人：200-250 ms")
+            })
         
         st.divider()
         
         st.info("**提示：**")
         st.write("- 確保良好光照")
         st.write("- 全身入鏡")
-        st.write("- 距離鏡頭2-3米")
-        st.write("- 出拳時不要猶豫")
+        st.write("- 出拳時動作明確")
 
 
-if __name__ == "__main__":
-    main()
+if __name
