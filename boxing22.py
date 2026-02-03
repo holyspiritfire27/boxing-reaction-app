@@ -15,8 +15,8 @@ class BoxingAnalystLogic:
         self.mp_pose = mp.solutions.pose
         self.mp_drawing = mp.solutions.drawing_utils
         self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_detection_confidence=0.5,  # 降低信心度要求
+            min_tracking_confidence=0.5,
             model_complexity=1
         )
         
@@ -26,14 +26,14 @@ class BoxingAnalystLogic:
         self.wait_until = 0
         self.command_display_until = 0
         
-        # 改進：更嚴格的預備姿勢檢測
+        # 放寬預備姿勢檢測
         self.guard_hold_start_time = None
         self.guard_stable_frames = 0
-        self.guard_stable_threshold = 15  # 需要連續15幀穩定
+        self.guard_stable_threshold = 8  # 降低到8幀
         self.guard_pose_valid = False
         
-        # 改進：防誤觸機制
-        self.min_punch_duration = 0.15  # 最短出拳持續時間
+        # 防誤觸機制
+        self.min_punch_duration = 0.15
         self.punch_start_time = None
         self.punch_detection_active = False
         self.false_trigger_count = 0
@@ -53,24 +53,25 @@ class BoxingAnalystLogic:
         self.current_fps = 0.0
         
         # 歷史數據緩衝
-        self.pos_history = deque(maxlen=15)
-        self.time_history = deque(maxlen=15)
+        self.pos_history = deque(maxlen=10)
+        self.time_history = deque(maxlen=10)
         self.prev_landmarks = None
         
-        # === 改進的物理參數 ===
+        # === 物理參數 ===
         self.SHOULDER_WIDTH_M = 0.45 
         
-        # 更嚴格的門檻防止誤觸
-        self.MIN_VELOCITY_THRESHOLD = 3.5  # 提高門檻
-        self.MIN_ACCELERATION_THRESHOLD = 25.0  # 提高加速度門檻
-        self.ACC_WINDOW = 0.3  # 稍微延長加速窗口
-        self.Z_PUNCH_THRESHOLD = 0.18  # 提高深度門檻
-        self.ARM_ANGLE_THRESHOLD = 130  # 提高角度門檻
+        # 速度計算參數
+        self.MIN_VELOCITY_THRESHOLD = 3.0  # 降低門檻
+        self.MIN_ACCELERATION_THRESHOLD = 20.0
+        self.ACC_WINDOW = 0.3
+        self.Z_PUNCH_THRESHOLD = 0.15  # 降低深度門檻
+        self.ARM_ANGLE_THRESHOLD = 125  # 降低角度門檻
         
-        # 預備姿勢參數
-        self.GUARD_ANGLE_MIN = 80  # 手肘最小角度
-        self.GUARD_ANGLE_MAX = 120  # 手肘最大角度
-        self.GUARD_HEIGHT_RATIO = 0.85  # 拳頭相對於頭部的高度
+        # 預備姿勢參數（放寬要求）
+        self.GUARD_ANGLE_MIN = 70  # 降低最小角度
+        self.GUARD_ANGLE_MAX = 130  # 提高最大角度
+        self.GUARD_HEIGHT_MIN = 0.6  # 拳頭高度下限（相對於鼻子）
+        self.GUARD_HEIGHT_MAX = 1.2  # 拳頭高度上限
         
         # 速度計算變數
         self.acc_start_time = None
@@ -79,7 +80,7 @@ class BoxingAnalystLogic:
         self.prev_instant_v = 0.0
         self.filtered_v = 0.0
         
-        # 改進：速度平滑
+        # 速度平滑
         self.speed_smoothing_factor = 0.2
         self.smoothed_speed = 0.0
         
@@ -119,7 +120,7 @@ class BoxingAnalystLogic:
         dz = prev_pos.z - curr_pos.z  # 正值表示向前
         forward_velocity = max(0, dz * scale / dt)
         
-        # 計算總速度（考慮3D移動）
+        # 計算總速度
         dx = (prev_pos.x - curr_pos.x) * scale
         dy = (prev_pos.y - curr_pos.y) * scale
         total_velocity = np.sqrt(dx**2 + dy**2 + (dz**2)) / dt
@@ -128,10 +129,10 @@ class BoxingAnalystLogic:
 
     def calculate_speed_from_trajectory(self, positions, times, scale):
         """從軌跡計算速度和加速度"""
-        if len(positions) < 4:
+        if len(positions) < 3:
             return 0, 0, 0
         
-        # 提取Z軸位置（深度）
+        # 提取Z軸位置
         z_positions = [p.z * scale for p in positions]
         time_array = np.array(times) - times[0]
         
@@ -149,7 +150,6 @@ class BoxingAnalystLogic:
                     v = abs(z_positions[i-1] - z_positions[i]) / dt
                     velocities.append(v)
                     
-                    # 計算加速度
                     if i > 1 and (time_array[i-1] - time_array[i-2]) > 0:
                         prev_v = abs(z_positions[i-2] - z_positions[i-1]) / (time_array[i-1] - time_array[i-2])
                         a = (v - prev_v) / dt if dt > 0 else 0
@@ -164,7 +164,7 @@ class BoxingAnalystLogic:
         return 0, 0, 0
 
     def check_guard_pose(self, landmarks):
-        """檢查是否處於正確的預備姿勢"""
+        """檢查預備姿勢（放寬條件）"""
         if landmarks is None:
             return False
         
@@ -182,36 +182,42 @@ class BoxingAnalystLogic:
             l_angle = self.calculate_angle(l_shoulder, l_elbow, l_wrist)
             r_angle = self.calculate_angle(r_shoulder, r_elbow, r_wrist)
             
-            # 檢查角度是否在合理範圍
-            angle_ok = (self.GUARD_ANGLE_MIN < l_angle < self.GUARD_ANGLE_MAX and 
-                       self.GUARD_ANGLE_MIN < r_angle < self.GUARD_ANGLE_MAX)
+            # 檢查角度（放寬範圍）
+            l_angle_ok = self.GUARD_ANGLE_MIN <= l_angle <= self.GUARD_ANGLE_MAX
+            r_angle_ok = self.GUARD_ANGLE_MIN <= r_angle <= self.GUARD_ANGLE_MAX
             
-            # 檢查拳頭高度（應該在頭部附近）
-            l_height_ok = abs(l_wrist.y - nose.y) < 0.15
-            r_height_ok = abs(r_wrist.y - nose.y) < 0.15
+            # 檢查拳頭高度（放寬範圍）
+            l_height_ratio = l_wrist.y / nose.y if nose.y > 0 else 1.0
+            r_height_ratio = r_wrist.y / nose.y if nose.y > 0 else 1.0
             
-            # 檢查拳頭與肩膀的相對位置（應該在頭部兩側）
-            l_position_ok = abs(l_wrist.x - l_shoulder.x) < 0.2
-            r_position_ok = abs(r_wrist.x - r_shoulder.x) < 0.2
+            l_height_ok = self.GUARD_HEIGHT_MIN <= l_height_ratio <= self.GUARD_HEIGHT_MAX
+            r_height_ok = self.GUARD_HEIGHT_MIN <= r_height_ratio <= self.GUARD_HEIGHT_MAX
             
-            # 檢查對稱性
-            symmetry_ok = abs(l_angle - r_angle) < 20
+            # 檢查拳頭位置（在頭部兩側）
+            l_position_ok = l_wrist.x < l_shoulder.x  # 左拳在左肩左側
+            r_position_ok = r_wrist.x > r_shoulder.x  # 右拳在右肩右側
             
-            return (angle_ok and l_height_ok and r_height_ok and 
-                   l_position_ok and r_position_ok and symmetry_ok)
+            # 放寬對稱性要求
+            symmetry_ok = abs(l_angle - r_angle) < 40
+            
+            # 至少一隻手符合大部分條件即可
+            left_ok = (l_angle_ok and l_height_ok and l_position_ok)
+            right_ok = (r_angle_ok and r_height_ok and r_position_ok)
+            
+            return (left_ok and right_ok)  # 兩隻手都要基本符合
             
         except Exception as e:
             return False
 
     def get_speed_rating(self, speed):
         """速度評價"""
-        if speed < 4.0: return "慢速/暖身"
+        if speed < 4.0: return "慢速"
         elif speed < 6.0: return "初學者"
-        elif speed < 8.0: return "業餘水準"
-        elif speed < 10.0: return "專業級"
+        elif speed < 8.0: return "業餘"
+        elif speed < 10.0: return "專業"
         elif speed < 13.0: return "選手級"
         elif speed < 16.0: return "世界級"
-        else: return "傳奇級別"
+        else: return "傳奇"
 
     def get_reaction_rating(self, r_time):
         """反應時間評價"""
@@ -219,13 +225,12 @@ class BoxingAnalystLogic:
         elif r_time > 200: return "一般"
         elif r_time >= 150: return "良好"
         elif r_time >= 120: return "優異"
-        else: return "頂尖選手"
+        else: return "頂尖"
 
-    def draw_guard_indicator(self, image, h, w, guard_valid, progress):
+    def draw_guard_indicator(self, image, h, w, guard_valid, progress, feedback=""):
         """繪製預備姿勢指示器"""
-        # 位置調整到左上角，不擋住提示
         start_x, start_y = 20, 20
-        box_width, box_height = 400, 100
+        box_width, box_height = 400, 120
         
         # 半透明背景
         overlay = image.copy()
@@ -235,24 +240,55 @@ class BoxingAnalystLogic:
         cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
         
         if guard_valid:
-            status_text = "✓ 預備姿勢正確"
+            status_text = "✓ 姿勢正確"
             status_color = (0, 255, 0)
-            instruction = f"保持姿勢... {progress}%"
+            instruction = f"保持姿勢 {progress}%"
         else:
             status_text = "請舉手做好預備姿勢"
             status_color = (0, 165, 255)
             instruction = "雙手舉起，拳頭在臉頰兩側"
+            
+            if feedback:
+                instruction = feedback
+        
+        # 繪製邊框
+        cv2.rectangle(image, (start_x, start_y), 
+                     (start_x + box_width, start_y + box_height), 
+                     status_color, 2)
         
         image = self.put_chinese_text(image, status_text, 
-                                     (start_x + 10, start_y + 30), status_color, 28)
+                                     (start_x + 10, start_y + 35), status_color, 28)
         image = self.put_chinese_text(image, instruction, 
-                                     (start_x + 10, start_y + 70), (255, 255, 255), 22)
+                                     (start_x + 10, start_y + 75), (255, 255, 255), 22)
+        
+        # 進度條
+        bar_width = box_width - 20
+        bar_height = 8
+        bar_x = start_x + 10
+        bar_y = start_y + box_height - 20
+        
+        # 背景
+        cv2.rectangle(image, (bar_x, bar_y), 
+                     (bar_x + bar_width, bar_y + bar_height), 
+                     (100, 100, 100), -1)
+        
+        # 進度
+        fill_width = int(bar_width * progress / 100)
+        if progress > 70:
+            bar_color = (0, 255, 0)
+        elif progress > 40:
+            bar_color = (0, 255, 255)
+        else:
+            bar_color = (0, 165, 255)
+            
+        cv2.rectangle(image, (bar_x, bar_y), 
+                     (bar_x + fill_width, bar_y + bar_height), 
+                     bar_color, -1)
         
         return image
 
     def draw_prompt(self, image, h, w, target_side):
-        """繪製出拳提示（最前方顯示）"""
-        # 使用鮮明的顏色和大字體
+        """繪製出拳提示"""
         if target_side == 'LEFT':
             color = (0, 200, 255)  # 青色
             text = "左 拳 !"
@@ -260,56 +296,49 @@ class BoxingAnalystLogic:
             color = (255, 50, 150)  # 粉紅色
             text = "右 拳 !"
         
-        # 計算文字位置（屏幕中央偏上）
+        # 位置
         text_x = w // 2
         text_y = h // 3
         
-        # 繪製文字背景（不透明白色）
-        (text_width, text_height), baseline = cv2.getTextSize(
-            text, cv2.FONT_HERSHEY_SIMPLEX, 3, 6)
+        # 使用OpenCV繪製（確保顯示）
+        font_scale = 3.5
+        thickness = 8
         
-        bg_x1 = text_x - text_width//2 - 30
-        bg_y1 = text_y - text_height//2 - 20
-        bg_x2 = text_x + text_width//2 + 30
-        bg_y2 = text_y + text_height//2 + 20
+        # 計算文字大小
+        (text_width, text_height), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        
+        # 背景框
+        padding = 30
+        bg_x1 = text_x - text_width//2 - padding
+        bg_y1 = text_y - text_height//2 - padding
+        bg_x2 = text_x + text_width//2 + padding
+        bg_y2 = text_y + text_height//2 + padding
         
         # 白色背景
         cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), -1)
         cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), color, 8)
         
         # 繪製文字
-        if self.use_chinese:
-            # 使用中文字體
-            img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            draw = ImageDraw.Draw(img_pil)
-            font = ImageFont.truetype(self.font_path, 100)
-            
-            # 計算文字位置
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            
-            draw.text((text_x - text_width//2, text_y - text_height//2), 
-                     text, font=font, fill=color, stroke_width=6, stroke_fill=(0, 0, 0))
-            image = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-        else:
-            # 使用英文字體
-            cv2.putText(image, text, (text_x - text_width//2, text_y + text_height//2), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 3, color, 6)
+        text_pos = (text_x - text_width//2, text_y + text_height//2)
+        cv2.putText(image, text, text_pos, 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
         
-        # 添加倒數計時
+        # 倒數計時
         if self.command_display_until > 0:
             remaining = max(0, self.command_display_until - time.time())
             if remaining < 1.0:
                 countdown = f"{remaining:.1f}"
-                cv2.putText(image, countdown, (text_x - 50, text_y + 150), 
+                (cw, ch), _ = cv2.getTextSize(countdown, cv2.FONT_HERSHEY_SIMPLEX, 2, 4)
+                cv2.putText(image, countdown, 
+                           (text_x - cw//2, text_y + 150), 
                            cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 0), 4)
         
         return image
 
     def draw_results(self, image, h, w):
-        """繪製結果面板（底部）"""
-        panel_height = 340
+        """繪製結果面板"""
+        panel_height = 300
         start_y = h - panel_height
         
         # 半透明背景
@@ -317,16 +346,12 @@ class BoxingAnalystLogic:
         cv2.rectangle(overlay, (0, start_y), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
         
-        # 結果標題
-        title_y = start_y + 50
-        title = "🏆 本次出拳數據"
+        # 標題
+        title = "本次出拳數據"
+        cv2.putText(image, title, (20, start_y + 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
         
-        if self.use_chinese:
-            image = self.put_chinese_text(image, title, (20, title_y), (255, 255, 0), 32)
-        else:
-            cv2.putText(image, title, (20, title_y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
-        
-        # 主要數據
+        # 數據
         r_time_val = int(self.last_reaction_time)
         speed_val = self.last_punch_speed
         acc_val = self.last_punch_peak_acc
@@ -334,81 +359,81 @@ class BoxingAnalystLogic:
         r_rating = self.get_reaction_rating(r_time_val)
         s_rating = self.get_speed_rating(speed_val)
         
-        # 數據顯示
-        data_start_y = title_y + 60
+        y_offset = start_y + 80
         
-        if self.use_chinese:
-            image = self.put_chinese_text(image, f"⚡ 反應時間: {r_time_val} ms", 
-                                         (30, data_start_y), (200, 255, 200), 26)
-            image = self.put_chinese_text(image, f"[{r_rating}]", 
-                                         (300, data_start_y), (255, 255, 0), 24)
+        # 反應時間
+        cv2.putText(image, f"反應時間: {r_time_val} ms", 
+                   (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+        cv2.putText(image, f"[{r_rating}]", 
+                   (250, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        # 速度
+        cv2.putText(image, f"出拳速度: {speed_val:.1f} m/s", 
+                   (30, y_offset + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+        cv2.putText(image, f"[{s_rating}]", 
+                   (250, y_offset + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+        
+        # 加速度
+        cv2.putText(image, f"峰值加速度: {acc_val:.0f} m/s²", 
+                   (30, y_offset + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+        
+        # 分隔線
+        cv2.line(image, (20, y_offset + 110), (w - 20, y_offset + 110), (100, 100, 100), 1)
+        
+        # 歷史平均
+        if self.reaction_history:
+            avg_time = np.mean(self.reaction_history[-3:]) if len(self.reaction_history) >= 3 else 0
+            avg_speed = np.mean(self.speed_history[-3:]) if len(self.speed_history) >= 3 else 0
             
-            image = self.put_chinese_text(image, f"💨 出拳速度: {speed_val:.1f} m/s", 
-                                         (30, data_start_y + 50), (200, 255, 200), 26)
-            image = self.put_chinese_text(image, f"[{s_rating}]", 
-                                         (300, data_start_y + 50), (255, 200, 0), 24)
-            
-            image = self.put_chinese_text(image, f"🚀 峰值加速度: {acc_val:.0f} m/s²", 
-                                         (30, data_start_y + 100), (200, 255, 200), 26)
-        else:
-            cv2.putText(image, f"Reaction: {r_time_val} ms [{r_rating}]", 
-                       (30, data_start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
-            cv2.putText(image, f"Speed: {speed_val:.1f} m/s [{s_rating}]", 
-                       (30, data_start_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
-            cv2.putText(image, f"Acceleration: {acc_val:.0f} m/s²", 
-                       (30, data_start_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 255, 200), 2)
+            cv2.putText(image, "最近3次平均:", 
+                       (30, y_offset + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
+            cv2.putText(image, f"反應: {int(avg_time)} ms | 速度: {avg_speed:.1f} m/s", 
+                       (30, y_offset + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
         
         return image
 
     def draw_speed_bar(self, image, h, w):
         """繪製速度條"""
         bar_w, bar_h = 300, 25
-        start_x, start_y = w - 320, 80  # 移到右上方
+        start_x, start_y = w - 320, 80
         
         # 背景
         cv2.rectangle(image, (start_x, start_y), 
                      (start_x + bar_w, start_y + bar_h), (50, 50, 50), -1)
         
-        # 當前速度值
-        if self.state == 'STIMULUS':
-            display_val = self.smoothed_speed
-        else:
-            display_val = self.last_punch_speed
+        # 當前速度
+        display_val = self.smoothed_speed if self.state == 'STIMULUS' else self.last_punch_speed
         
-        # 比例計算（20 m/s為滿格）
+        # 比例
         display_ratio = min(1.0, display_val / 20.0)
         fill_w = int(display_ratio * bar_w)
         
-        # 漸層顏色
+        # 顏色
         if display_ratio < 0.3: 
-            color = (0, 255, 255)  # 青色
+            color = (0, 255, 255)
         elif display_ratio < 0.6:
-            color = (0, 255, 0)    # 綠色
+            color = (0, 255, 0)
         elif display_ratio < 0.8:
-            color = (0, 165, 255)  # 橙色
+            color = (0, 165, 255)
         else:
-            color = (255, 0, 0)    # 紅色
+            color = (255, 0, 0)
         
-        # 繪製速度條
+        # 繪製
         cv2.rectangle(image, (start_x, start_y), 
-                     (start_x + fill_w, start_y + bar_h), 
-                     color, -1)
+                     (start_x + fill_w, start_y + bar_h), color, -1)
         
         # 邊框
         cv2.rectangle(image, (start_x, start_y), 
-                     (start_x + bar_w, start_y + bar_h), 
-                     (200, 200, 200), 2)
+                     (start_x + bar_w, start_y + bar_h), (200, 200, 200), 2)
         
-        # 添加刻度
+        # 刻度
         for i in range(1, 5):
             x_pos = start_x + int(i * 0.2 * bar_w)
-            cv2.line(image, (x_pos, start_y), 
-                    (x_pos, start_y + bar_h), (100, 100, 100), 1)
+            cv2.line(image, (x_pos, start_y), (x_pos, start_y + bar_h), (100, 100, 100), 1)
         
         # 標籤
-        label_text = f"Speed: {display_val:.1f} m/s"
-        cv2.putText(image, label_text, (start_x, start_y - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(image, f"即時速度: {display_val:.1f} m/s", 
+                   (start_x, start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         return image
 
@@ -451,8 +476,24 @@ class BoxingAnalystLogic:
             
             # 狀態 1: 等待預備姿勢
             if self.state == 'WAIT_GUARD':
-                # 檢查姿勢是否正確
                 guard_valid = self.check_guard_pose(landmarks)
+                feedback = ""
+                
+                # 提供反饋
+                if not guard_valid:
+                    # 檢查具體問題
+                    try:
+                        l_angle = self.calculate_angle(landmarks[11], landmarks[13], landmarks[15])
+                        r_angle = self.calculate_angle(landmarks[12], landmarks[14], landmarks[16])
+                        
+                        if l_angle < 50 or r_angle < 50:
+                            feedback = "手肘太彎曲，請伸直一點"
+                        elif l_angle > 150 or r_angle > 150:
+                            feedback = "手臂太直，請彎曲一點"
+                        else:
+                            feedback = "雙手舉高，拳頭在臉頰兩側"
+                    except:
+                        feedback = "請面對鏡頭，雙手舉起"
                 
                 if guard_valid:
                     self.guard_stable_frames += 1
@@ -465,37 +506,42 @@ class BoxingAnalystLogic:
                             self.guard_hold_start_time = current_time
                         
                         hold_duration = current_time - self.guard_hold_start_time
-                        required_duration = 1.5  # 需要保持1.5秒
+                        required_duration = 1.0  # 降低到1秒
                         progress = min(100, int((hold_duration / required_duration) * 100))
                         
-                        # 繪製預備姿勢指示器
-                        image = self.draw_guard_indicator(image, h, w, True, progress)
+                        # 繪製指示器
+                        image = self.draw_guard_indicator(image, h, w, True, progress, feedback)
                         
                         # 如果保持足夠時間，進入預備狀態
                         if hold_duration > required_duration:
                             self.state = 'PRE_START'
-                            self.wait_until = current_time + random.uniform(1.5, 3.0)
+                            self.wait_until = current_time + random.uniform(1.0, 2.0)  # 縮短等待時間
                             self.guard_hold_start_time = None
                             self.guard_stable_frames = 0
+                            # 顯示狀態變更
+                            cv2.putText(image, "準備開始!", (w//2 - 100, h//2), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
                     else:
                         progress = int((self.guard_stable_frames / self.guard_stable_threshold) * 100)
-                        image = self.draw_guard_indicator(image, h, w, False, progress)
+                        image = self.draw_guard_indicator(image, h, w, False, progress, feedback)
                 else:
                     self.guard_stable_frames = 0
                     self.guard_hold_start_time = None
-                    image = self.draw_guard_indicator(image, h, w, False, 0)
+                    progress = 0
+                    image = self.draw_guard_indicator(image, h, w, False, progress, feedback)
             
-            # 狀態 2: 預備開始（倒數）
+            # 狀態 2: 預備開始
             elif self.state == 'PRE_START':
-                # 持續檢查姿勢
+                # 檢查姿勢
                 if not self.check_guard_pose(landmarks):
                     self.state = 'WAIT_GUARD'
-                    image = self.draw_guard_indicator(image, h, w, False, 0)
+                    cv2.putText(image, "姿勢不正確，重新開始", (w//2 - 150, h//2), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
                 elif current_time > self.wait_until:
                     # 隨機選擇目標
                     self.state, self.target = 'STIMULUS', random.choice(['LEFT', 'RIGHT'])
                     self.start_time = current_time
-                    self.command_display_until = current_time + 1.5  # 顯示1.5秒
+                    self.command_display_until = current_time + 1.2
                     
                     # 重置計數器
                     self.max_v_temp = 0.0
@@ -508,9 +554,8 @@ class BoxingAnalystLogic:
                     self.punch_detection_active = False
                     self.show_results = False
             
-            # 狀態 3: 刺激階段（顯示提示）
+            # 狀態 3: 顯示提示
             if self.state in ['STIMULUS', 'RESULT_PENDING']:
-                # 顯示出拳提示（最前方）
                 if current_time <= self.command_display_until:
                     image = self.draw_prompt(image, h, w, self.target)
             
@@ -538,10 +583,10 @@ class BoxingAnalystLogic:
                     
                     # 計算速度
                     total_v, forward_v = self.calculate_3d_velocity(wrist, prev_wrist, scale, dt)
-                    velocity = forward_v  # 主要使用前向速度
+                    velocity = forward_v
                     
                     # 平滑處理
-                    self.smoothed_speed = (self.smoothed_speed * 0.8 + velocity * 0.2)
+                    self.smoothed_speed = (self.smoothed_speed * 0.7 + velocity * 0.3)
                     
                     # 計算加速度
                     if self.prev_instant_v > 0 and dt > 0:
@@ -549,14 +594,13 @@ class BoxingAnalystLogic:
                     
                     self.prev_instant_v = velocity
                 
-                # 防誤觸機制：需要持續一定時間
+                # 檢測出拳開始
                 if velocity > self.MIN_VELOCITY_THRESHOLD:
                     if self.punch_start_time is None:
                         self.punch_start_time = current_time
                         self.punch_detection_active = True
                 else:
                     if self.punch_detection_active and (current_time - self.punch_start_time < self.min_punch_duration):
-                        # 短暫動作，忽略
                         self.false_trigger_count += 1
                         
                         if self.false_trigger_count >= self.false_trigger_threshold:
@@ -564,7 +608,7 @@ class BoxingAnalystLogic:
                             self.punch_start_time = None
                             self.false_trigger_count = 0
                 
-                # 更新最大值（只有在有效出拳檢測期間）
+                # 更新最大值
                 if self.punch_detection_active:
                     self.max_v_temp = max(self.max_v_temp, self.smoothed_speed)
                     self.max_acc_temp = max(self.max_acc_temp, acceleration)
@@ -572,7 +616,7 @@ class BoxingAnalystLogic:
                     if acceleration > self.MIN_ACCELERATION_THRESHOLD and self.acc_start_time is None:
                         self.acc_start_time = current_time
                 
-                # 擊中條件（更嚴格）
+                # 擊中條件
                 cond_duration = (self.punch_start_time is not None and 
                                 (current_time - self.punch_start_time) > self.min_punch_duration)
                 cond_speed = self.max_v_temp > self.MIN_VELOCITY_THRESHOLD
@@ -580,43 +624,15 @@ class BoxingAnalystLogic:
                 cond_angle = angle > self.ARM_ANGLE_THRESHOLD
                 cond_forward = (shoulder.z - wrist.z) > self.Z_PUNCH_THRESHOLD
                 
-                # 使用軌跡擬合計算最終速度
-                final_speed = self.max_v_temp
-                final_acc = self.max_acc_temp
-                
-                if self.punch_detection_active and len(self.pos_history) >= 5:
-                    recent_positions = []
-                    recent_times = []
-                    
-                    for i in range(min(8, len(self.pos_history))):
-                        idx = -1 - i
-                        pos = self.pos_history[idx]
-                        wrist_pos = pos[wrist_idx]
-                        recent_positions.append(wrist_pos)
-                        recent_times.append(self.time_history[idx])
-                    
-                    recent_positions.reverse()
-                    recent_times.reverse()
-                    
-                    _, peak_v, peak_a = self.calculate_speed_from_trajectory(recent_positions, recent_times, scale)
-                    
-                    if peak_v > 0:
-                        final_speed = peak_v
-                        final_acc = max(final_acc, peak_a)
-                
-                # 判定擊中（需要同時滿足多個條件）
+                # 判定擊中
                 if (cond_duration and cond_speed and cond_acc and 
                     (cond_angle or cond_forward)):
                     
                     self.last_reaction_time = (current_time - self.start_time) * 1000
-                    self.last_punch_speed = final_speed
-                    self.last_punch_peak_acc = final_acc
+                    self.last_punch_speed = min(25.0, self.max_v_temp)  # 限制最大值
+                    self.last_punch_peak_acc = self.max_acc_temp
                     
-                    # 避免極端值
-                    if self.last_punch_speed > 25.0:
-                        self.last_punch_speed = min(25.0, final_speed)
-                    
-                    # 保存歷史數據
+                    # 保存數據
                     self.reaction_history.append(self.last_reaction_time)
                     self.speed_history.append(self.last_punch_speed)
                     self.acc_history.append(self.last_punch_peak_acc)
@@ -626,7 +642,7 @@ class BoxingAnalystLogic:
                     self.wait_until = current_time + 1.0
                 
                 # 超時處理
-                if (current_time - self.start_time) > 4.0:
+                if (current_time - self.start_time) > 3.5:
                     self.state = 'WAIT_GUARD'
             
             elif self.state == 'RESULT_PENDING':
@@ -641,20 +657,26 @@ class BoxingAnalystLogic:
             
             self.prev_landmarks = landmarks
         
+        else:
+            # 沒有檢測到姿勢
+            if self.state == 'WAIT_GUARD':
+                cv2.putText(image, "請面對鏡頭站立", (w//2 - 150, h//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+        
         self.prev_time = current_time
         
-        # 繪製UI（分層繪製）
+        # 繪製UI
         if self.show_results and self.state != 'STIMULUS':
             image = self.draw_results(image, h, w)
         
-        # 速度條總是顯示
+        # 速度條
         if self.state in ['STIMULUS', 'RESULT_PENDING', 'RESULT']:
             image = self.draw_speed_bar(image, h, w)
         
         # FPS顯示
         fps_text = f"FPS: {self.current_fps:.1f}"
-        cv2.putText(image, fps_text, (w - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (0, 255, 0), 2)
+        cv2.putText(image, fps_text, (w - 120, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         return image
 
@@ -673,25 +695,25 @@ class VideoProcessor(VideoTransformerBase):
 
 
 def main():
-    st.set_page_config(page_title="拳擊反應分析系統", layout="wide")
-    st.title("🥊 拳擊反應分析系統 - 精準物理版")
+    st.set_page_config(page_title="拳擊反應分析", layout="wide")
+    st.title("🥊 拳擊反應分析系統")
     
     with st.sidebar:
-        st.header("🎯 系統特色")
-        st.success("**主要功能：**")
-        st.write("✓ 強化預備姿勢檢測")
-        st.write("✓ 防誤觸機制")
-        st.write("✓ 分層UI設計")
-        st.write("✓ 精準速度計算")
+        st.header("使用說明")
+        
+        st.markdown("### 步驟：")
+        st.markdown("1. **面對鏡頭站立**")
+        st.markdown("2. **雙手舉起**，拳頭放在臉頰兩側")
+        st.markdown("3. **保持姿勢**直到進度條滿")
+        st.markdown("4. **看到提示後**快速出拳")
+        st.markdown("5. **查看分析結果**")
         
         st.divider()
         
-        st.info("**使用說明：**")
-        st.write("1. 面對鏡頭站立")
-        st.write("2. 舉起雙手，拳頭放在臉頰兩側")
-        st.write("3. 保持姿勢直到系統提示")
-        st.write("4. 看到提示後快速出拳")
-        st.write("5. 查看分析結果")
+        st.markdown("### 姿勢提示：")
+        st.markdown("- 手肘彎曲約90度")
+        st.markdown("- 拳頭與頭部同高")
+        st.markdown("- 放鬆肩膀")
         
         st.divider()
         
@@ -702,12 +724,11 @@ def main():
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.subheader("即時分析畫面")
+        st.subheader("即時分析")
         
-        # 創建一個更寬容的媒體約束
+        # 寬容的媒體約束
         media_stream_constraints = {
             "video": {
-                # 使用更寬容的設定
                 "width": {"ideal": 640, "min": 320},
                 "height": {"ideal": 480, "min": 240},
                 "frameRate": {"ideal": 30, "min": 15}
@@ -715,21 +736,8 @@ def main():
             "audio": False
         }
         
-        # 可選：允許使用者選擇攝影機
-        video_source = st.selectbox(
-            "選擇攝影機",
-            ["預設攝影機", "前置攝影機", "後置攝影機"],
-            index=0
-        )
-        
-        # 根據選擇調整約束
-        if video_source == "前置攝影機":
-            media_stream_constraints["video"]["facingMode"] = {"ideal": "user"}
-        elif video_source == "後置攝影機":
-            media_stream_constraints["video"]["facingMode"] = {"ideal": "environment"}
-        
         ctx = webrtc_streamer(
-            key="boxing-analyzer",
+            key="boxing-analyzer-simple",
             video_processor_factory=VideoProcessor,
             media_stream_constraints=media_stream_constraints,
             async_processing=True,
@@ -739,19 +747,19 @@ def main():
         )
         
         if not ctx.state.playing:
-            st.info("👆 請點擊上方「START」按鈕開始")
-            st.warning("如果遇到攝影機權限問題，請確保：")
-            st.write("1. 允許瀏覽器存取攝影機")
-            st.write("2. 沒有其他程式在使用攝影機")
-            st.write("3. 刷新頁面重試")
+            st.info("👆 點擊「START」按鈕開始分析")
+            st.warning("如果無法啟動攝影機：")
+            st.markdown("1. 允許瀏覽器存取攝影機")
+            st.markdown("2. 確保攝影機未被其他程式使用")
+            st.markdown("3. 刷新頁面重試")
     
     with col2:
-        st.subheader("📊 等級對照表")
+        st.subheader("等級參考")
         
         with st.expander("速度等級", expanded=True):
             st.table({
-                "等級": ["暖身", "初學者", "業餘", "專業", "選手", "世界級", "傳奇"],
-                "速度(m/s)": ["<4", "4-6", "6-8", "8-10", "10-13", "13-16", ">16"],
+                "等級": ["初學", "業餘", "專業", "選手", "頂尖"],
+                "速度(m/s)": ["<6", "6-8", "8-10", "10-13", ">13"],
             })
         
         with st.expander("反應時間", expanded=True):
@@ -762,12 +770,11 @@ def main():
         
         st.divider()
         
-        st.info("**提示：**")
-        st.write("- 確保良好光照")
-        st.write("- 全身入鏡")
-        st.write("- 出拳時動作明確")
+        st.info("💡 **提示**")
+        st.markdown("- 確保光線充足")
+        st.markdown("- 全身入鏡")
+        st.markdown("- 出拳時動作明確")
 
 
 if __name__ == "__main__":
     main()
-
