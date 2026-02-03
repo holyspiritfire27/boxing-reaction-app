@@ -3,7 +3,6 @@ import numpy as np
 import streamlit as st
 import time
 import random
-import mediapipe as mp
 import math
 
 # 設置頁面
@@ -31,16 +30,6 @@ if 'last_update' not in st.session_state:
 
 class BoxingAnalyst:
     def __init__(self):
-        # 初始化 MediaPipe（不使用 GPU）
-        self.mp_pose = mp.solutions.pose
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=0,  # 使用最簡單模型
-            enable_segmentation=False
-        )
-        
         # 狀態變數
         self.state = 'IDLE'  # IDLE, READY, COUNTDOWN, PUNCHING, RESULT
         self.target = None
