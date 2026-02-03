@@ -4,6 +4,7 @@ import streamlit as st
 import time
 import random
 import math
+import pandas as pd
 
 # 設置頁面
 st.set_page_config(
@@ -27,6 +28,8 @@ if 'results' not in st.session_state:
     }
 if 'last_update' not in st.session_state:
     st.session_state.last_update = 0
+if 'frame_count' not in st.session_state:
+    st.session_state.frame_count = 0
 
 class BoxingAnalyst:
     def __init__(self):
@@ -45,7 +48,6 @@ class BoxingAnalyst:
         self.max_speed = 0
         
         # 物理參數
-        self.SHOULDER_WIDTH = 0.45  # 平均肩寬（米）
         self.MIN_PUNCH_SPEED = 2.0  # 最小出拳速度
         
         # 模擬數據
@@ -399,6 +401,7 @@ def main():
                 st.session_state.analyst.start_test()
                 st.session_state.test_started = True
                 st.session_state.last_update = time.time()
+                st.session_state.frame_count = 0
                 st.rerun()
                 
         with col2:
@@ -413,6 +416,7 @@ def main():
                     'test_count': 0
                 }
                 st.session_state.test_started = False
+                st.session_state.frame_count = 0
                 st.rerun()
         
         st.divider()
@@ -509,9 +513,12 @@ def main():
         if st.session_state.test_started:
             analyst.update_state()
             
-            # 自動刷新畫面
+            # 自動刷新畫面（限制刷新頻率）
             current_time = time.time()
-            if current_time - st.session_state.last_update > 0.1:  # 每0.1秒更新一次
+            st.session_state.frame_count += 1
+            
+            # 每10幀刷新一次，避免過度刷新
+            if current_time - st.session_state.last_update > 0.1 and st.session_state.frame_count % 10 == 0:
                 st.session_state.last_update = current_time
                 st.rerun()
         
@@ -659,8 +666,6 @@ def main():
         results = st.session_state.results
         
         if results['test_count'] > 0:
-            import pandas as pd
-            
             # 創建數據框
             test_numbers = list(range(1, results['test_count'] + 1))
             
