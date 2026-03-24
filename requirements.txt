@@ -1,8 +1,7 @@
 streamlit==1.32.2
-streamlit-webrtc==0.47.7
+streamlit-webrtc==0.45.0
 opencv-python-headless==4.7.0.72
 mediapipe==0.10.9
 numpy==1.23.5
 protobuf==3.20.3
-av==9.2.0
 Pillow
