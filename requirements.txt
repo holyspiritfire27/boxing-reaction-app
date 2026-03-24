@@ -1,7 +1,7 @@
 streamlit
 streamlit-webrtc
-opencv-python-headless
+opencv-python-headless==4.8.1.78
 mediapipe==0.10.9
-protobuf==3.20.3
-numpy
 av
+numpy
+Pillow
