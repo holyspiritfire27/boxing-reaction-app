@@ -1,3 +1,8 @@
+import os
+# 🔥 解決 Streamlit Cloud 上的 MediaPipe 模型下載權限問題 (PermissionError)
+os.environ["MEDIAPIPE_CACHE_DIR"] = "/tmp/mediapipe"
+os.makedirs("/tmp/mediapipe", exist_ok=True)
+
 import cv2
 import av
 import numpy as np
@@ -9,7 +14,7 @@ import random
 from PIL import ImageFont, ImageDraw, Image
 
 # ================= 配置與常數 =================
-st.set_page_config(page_title="拳擊反應 V32 (極致流暢版)", layout="wide", page_icon="🥊")
+st.set_page_config(page_title="拳擊反應 V33 (雲端穩定版)", layout="wide", page_icon="🥊")
 
 # 顏色定義 (B, G, R)
 COLOR_CYAN = (255, 255, 0)
@@ -24,7 +29,7 @@ SHOULDER_WIDTH_M = 0.45
 class BoxingAnalystLogic:
     def __init__(self):
         self.mp_pose = mp.solutions.pose
-        # ⚡ 優化 2: 降低 model_complexity 減輕運算負擔
+        # 降低 model_complexity 減輕運算負擔
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -50,11 +55,11 @@ class BoxingAnalystLogic:
         self.prev_time = 0
         self.max_speed_in_round = 0.0
         
-        # ⚡ 優化 1: 滑動最大速度緩衝區
+        # 滑動最大速度緩衝區
         self.speed_buffer = []
         self.buffer_size = 5
         
-        # ⚡ 跳幀計數器與截圖儲存
+        # 跳幀計數器與截圖儲存
         self.frame_count = 0
         self.final_image = None
         
@@ -129,7 +134,7 @@ class BoxingAnalystLogic:
         raw_max_speed = hands_data[fastest_hand]['speed']
         is_extending = hands_data[fastest_hand]['is_extending']
         
-        # ⚡ 優化 1: 滑動最大速度 (解決抖動誤判)
+        # 滑動最大速度 (解決抖動誤判)
         self.speed_buffer.append(raw_max_speed)
         if len(self.speed_buffer) > self.buffer_size:
             self.speed_buffer.pop(0)
@@ -156,7 +161,7 @@ class BoxingAnalystLogic:
         self.right_stats = {'reaction': [], 'speed': []}
         self.prev_landmarks = None
         self.speed_buffer = [] # 清空速度緩衝
-        self.final_image = None # ⚡ 清空舊截圖
+        self.final_image = None # 清空舊截圖
 
     def process(self, img):
         img = cv2.flip(img, 1) 
@@ -166,7 +171,7 @@ class BoxingAnalystLogic:
         current_time = time.time()
         dt = current_time - self.prev_time
         
-        # ⚡ 優化 3: 跳幀處理 (不跳過 UI 繪製，只跳過耗時的 Pose 推論)
+        # 跳幀處理 (不跳過 UI 繪製，只跳過耗時的 Pose 推論)
         self.frame_count += 1
         if self.frame_count % 2 != 0:
             # 奇數幀：執行骨架辨識
@@ -235,7 +240,7 @@ class BoxingAnalystLogic:
             img = self.put_chinese_text(img, f"拳速評級: {sp_rank}", (cx + 160, rank_y), sp_color, 45, 2, center_align=True)
             img = self.put_chinese_text(img, f"命中率: {accuracy:.0f}% ({self.hit_count}/10)", (cx, rank_y + 80), COLOR_GREEN, 55, 3, center_align=True)
             
-            # ⚡ 如果截圖還不存在，保存當前完成繪製的畫面
+            # 如果截圖還不存在，保存當前完成繪製的畫面
             if self.final_image is None:
                 self.final_image = img.copy()
 
@@ -369,14 +374,13 @@ class VideoProcessor(VideoTransformerBase):
             return frame
 
 def main():
-    st.title("🥊 拳擊反應測試 V32 (極致流暢版)")
+    st.title("🥊 拳擊反應測試 V33 (雲端修復版)")
     
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        # ⚡ 優化 2: 設定低解析度限制，大幅提升畫面更新率
         webrtc_ctx = webrtc_streamer(
-            key="boxing-v32",
+            key="boxing-v33",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
             video_processor_factory=VideoProcessor,
@@ -392,29 +396,25 @@ def main():
         )
         
     with col2:
-        st.markdown("### ⚡ V32 性能覺醒")
+        st.markdown("### ☁️ V33 雲端部署修復")
         st.markdown("""
-        **1. 消除抖動誤判:**
-        * 導入動態滑動視窗緩衝技術，慢拳快拳差異更清晰！
+        **1. 權限修復 (PermissionError):**
+        * 已解決 Streamlit Community Cloud 無法寫入 MediaPipe 模型的報錯。
         
-        **2. FPS 大幅提升:**
-        * 降低運算負載與智慧跳幀，操作更跟手。
-        
-        **3. 戰績一鍵下載:**
-        * 測驗結束後提供專屬截圖存檔。
+        **2. 核心效能保留:**
+        * 延續 V32 的平滑濾波與跳幀處理，低延遲不卡頓。
+        * 截圖下載功能支援！
         """)
         
-        # ⚡ 下載按鈕 (確保從 WebRTC 的背景執行緒中安全讀取圖片)
         if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
             logic = webrtc_ctx.video_processor.logic
             if logic.state == 'GAME_OVER' and logic.final_image is not None:
                 st.success("🎉 測驗完成！")
-                # 轉檔 JPG
                 _, buffer = cv2.imencode(".jpg", logic.final_image)
                 st.download_button(
                     label="📸 下載成績截圖 (JPG)",
                     data=buffer.tobytes(),
-                    file_name="boxing_result_v32.jpg",
+                    file_name="boxing_result_v33.jpg",
                     mime="image/jpeg",
                     use_container_width=True
                 )
