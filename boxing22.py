@@ -1,423 +1,115 @@
-import os
-# 🔥 解決 Streamlit Cloud 上的 MediaPipe 模型下載權限問題 (PermissionError)
-os.environ["MEDIAPIPE_CACHE_DIR"] = "/tmp/mediapipe"
-os.makedirs("/tmp/mediapipe", exist_ok=True)
-
-import cv2
+import streamlit as st
 import av
 import numpy as np
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration, WebRtcMode
 import mediapipe as mp
-import time
-import random
-from PIL import ImageFont, ImageDraw, Image
+from PIL import Image, ImageDraw
+import io
+from streamlit_webrtc import webrtc_streamer
 
-# ================= 配置與常數 =================
-st.set_page_config(page_title="拳擊反應 V33 (雲端穩定版)", layout="wide", page_icon="🥊")
+# ==========================================
+# 1. 頁面與 MediaPipe 初始化
+# ==========================================
+st.set_page_config(page_title="Boxing Reaction App", page_icon="🥊", layout="wide")
 
-# 顏色定義 (B, G, R)
-COLOR_CYAN = (255, 255, 0)
-COLOR_RED = (50, 50, 255)
-COLOR_GREEN = (0, 255, 0)
-COLOR_ERROR = (0, 0, 255)
-COLOR_TEXT = (255, 255, 255)
-COLOR_WARNING = (0, 165, 255)
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
 
-SHOULDER_WIDTH_M = 0.45 
-
-class BoxingAnalystLogic:
+# ==========================================
+# 2. 定義核心影像處理器 (完全無 cv2)
+# ==========================================
+class BoxingPoseProcessor:
     def __init__(self):
-        self.mp_pose = mp.solutions.pose
-        # 降低 model_complexity 減輕運算負擔
-        self.pose = self.mp_pose.Pose(
+        # 初始化 MediaPipe Pose 模型
+        self.pose = mp_pose.Pose(
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=0 
+            min_tracking_confidence=0.5
         )
-        
-        self.state = 'WAIT_GUARD' 
-        self.start_time = 0
-        self.stimulus_time = 0
-        self.target = None 
-        self.game_over_time = 0
-        
-        self.max_rounds = 10
-        self.current_round = 0
-        self.is_first_round = True
-        
-        self.hit_count = 0 
-        self.left_stats = {'reaction': [], 'speed': []}
-        self.right_stats = {'reaction': [], 'speed': []}
-        self.last_result = {"reaction": 0, "speed": 0, "target": "", "punched_hand": "", "is_hit": False}
-        
-        self.prev_landmarks = None
-        self.prev_time = 0
-        self.max_speed_in_round = 0.0
-        
-        # 滑動最大速度緩衝區
-        self.speed_buffer = []
-        self.buffer_size = 5
-        
-        # 跳幀計數器與截圖儲存
-        self.frame_count = 0
-        self.final_image = None
-        
-        self.font_path = "font.ttf" 
+        # 用來儲存最後一幀畫面，供截圖下載使用
+        self.last_frame = None
 
-    def put_chinese_text(self, img, text, pos, color, size=30, stroke_width=0, center_align=False):
-        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        # 👉 1. 直接取得 RGB 格式的 numpy array
+        img = frame.to_ndarray(format="rgb24")
+
+        # 👉 2. 進行骨架偵測
+        results = self.pose.process(img)
+
+        # 👉 3. 畫出骨架
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(
+                img,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
+                mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2)
+            )
+
+        # 👉 4. 使用 PIL 畫 UI (標靶、文字)
+        img_pil = Image.fromarray(img)
         draw = ImageDraw.Draw(img_pil)
         
-        try:
-            font = ImageFont.truetype(self.font_path, size)
-        except:
-            try:
-                font = ImageFont.load_default()
-            except:
-                return img
-        
-        pil_color = (color[2], color[1], color[0])
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        
-        draw_x, draw_y = pos
-        if center_align:
-            draw_x = pos[0] - text_w // 2
-        
-        if stroke_width > 0:
-            draw.text((draw_x, draw_y), text, font=font, fill=pil_color, stroke_width=stroke_width, stroke_fill=(0,0,0))
-        else:
-            draw.text((draw_x, draw_y), text, font=font, fill=pil_color)
-            
-        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        # 畫一個虛擬打擊目標 (紅色框框)
+        draw.rectangle([(50, 50), (150, 150)], outline=(255, 0, 0), width=3)
+        # 寫上狀態文字
+        draw.text((55, 55), "TARGET", fill=(255, 0, 0))
 
-    def get_landmarks(self, results, width, height):
-        if not results or not results.pose_landmarks:
-            return None
-        lm = results.pose_landmarks.landmark
-        coords = {}
-        key_points = {'L_SH': 11, 'R_SH': 12, 'L_WR': 15, 'R_WR': 16, 'L_EL': 13, 'R_EL': 14}
-        for name, idx in key_points.items():
-            coords[name] = np.array([lm[idx].x * width, lm[idx].y * height])
-        return coords
+        # 將畫好的圖片轉回 numpy array
+        img = np.array(img_pil)
 
-    def detect_punch_v4(self, coords, dt):
-        if not self.prev_landmarks or dt <= 0:
-            return 0.0, False, None, 0.0
-            
-        shoulder_dist_px = np.linalg.norm(coords['L_SH'] - coords['R_SH'])
-        if shoulder_dist_px < 10: return 0.0, False, None, 0.0
-        pixels_per_meter = shoulder_dist_px / SHOULDER_WIDTH_M
-        
-        hands_data = {}
-        
-        for physical_hand in ['LEFT', 'RIGHT']:
-            if physical_hand == 'LEFT':
-                sh_key, el_key, wr_key = 'R_SH', 'R_EL', 'R_WR'
-            else:
-                sh_key, el_key, wr_key = 'L_SH', 'L_EL', 'L_WR'
-            
-            wrist_disp = np.linalg.norm(coords[wr_key] - self.prev_landmarks[wr_key])
-            wrist_speed = (wrist_disp / pixels_per_meter) / dt
-            elbow_disp = np.linalg.norm(coords[el_key] - self.prev_landmarks[el_key])
-            elbow_speed = (elbow_disp / pixels_per_meter) / dt
-            
-            curr_arm_len = np.linalg.norm(coords[sh_key] - coords[wr_key])
-            prev_arm_len = np.linalg.norm(self.prev_landmarks[sh_key] - self.prev_landmarks[wr_key])
-            is_extending = curr_arm_len > prev_arm_len + 2 
-            
-            composite_speed = (wrist_speed * 0.6) + (elbow_speed * 0.4)
-            hands_data[physical_hand] = {'speed': composite_speed, 'is_extending': is_extending}
-            
-        fastest_hand = 'LEFT' if hands_data['LEFT']['speed'] > hands_data['RIGHT']['speed'] else 'RIGHT'
-        raw_max_speed = hands_data[fastest_hand]['speed']
-        is_extending = hands_data[fastest_hand]['is_extending']
-        
-        # 滑動最大速度 (解決抖動誤判)
-        self.speed_buffer.append(raw_max_speed)
-        if len(self.speed_buffer) > self.buffer_size:
-            self.speed_buffer.pop(0)
-        
-        smoothed_speed = max(self.speed_buffer)
-        max_speed = smoothed_speed  # 使用平滑後的速度
-        
-        threshold_normal = 0.5   
-        threshold_explosive = 1.2 
-        completion = min(max_speed / threshold_normal, 1.0)
-        
-        is_punch = False
-        if (max_speed > threshold_normal and is_extending) or max_speed > threshold_explosive:
-            is_punch = True
-            
-        return max_speed, is_punch, fastest_hand, completion
+        # 👉 5. 將結果存下來供截圖使用，並回傳給 WebRTC 顯示
+        self.last_frame = img.copy()
+        return av.VideoFrame.from_ndarray(img, format="rgb24")
 
-    def reset_game(self):
-        self.state = 'WAIT_GUARD'
-        self.current_round = 0
-        self.hit_count = 0
-        self.is_first_round = True
-        self.left_stats = {'reaction': [], 'speed': []}
-        self.right_stats = {'reaction': [], 'speed': []}
-        self.prev_landmarks = None
-        self.speed_buffer = [] # 清空速度緩衝
-        self.final_image = None # 清空舊截圖
-
-    def process(self, img):
-        img = cv2.flip(img, 1) 
-        h, w, _ = img.shape
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        current_time = time.time()
-        dt = current_time - self.prev_time
-        
-        # 跳幀處理 (不跳過 UI 繪製，只跳過耗時的 Pose 推論)
-        self.frame_count += 1
-        if self.frame_count % 2 != 0:
-            # 奇數幀：執行骨架辨識
-            results = self.pose.process(img_rgb)
-            coords = self.get_landmarks(results, w, h)
-            self.prev_time = current_time # 只有在推論時才更新時間與座標
-            self.prev_landmarks = coords
-        else:
-            # 偶數幀：沿用上一幀的座標，不跑辨識 (省資源)
-            results = None
-            coords = self.prev_landmarks
-
-        # 畫骨架
-        if results and results.pose_landmarks:
-            mp.solutions.drawing_utils.draw_landmarks(img, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
-
-        # ================= 狀態機 =================
-        if self.state == 'GAME_OVER':
-            overlay = img.copy()
-            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
-            img = cv2.addWeighted(overlay, 0.92, img, 0.08, 0)
-            
-            all_rt = self.left_stats['reaction'] + self.right_stats['reaction']
-            all_sp = self.left_stats['speed'] + self.right_stats['speed']
-            
-            l_rt = np.mean(self.left_stats['reaction']) if self.left_stats['reaction'] else 0
-            l_sp = np.mean(self.left_stats['speed']) if self.left_stats['speed'] else 0
-            r_rt = np.mean(self.right_stats['reaction']) if self.right_stats['reaction'] else 0
-            r_sp = np.mean(self.right_stats['speed']) if self.right_stats['speed'] else 0
-            
-            total_avg_rt = np.mean(all_rt) if all_rt else 0
-            total_avg_sp = np.mean(all_sp) if all_sp else 0
-            
-            accuracy = (self.hit_count / 10) * 100
-            
-            rt_rank, rt_color = "C (加油)", COLOR_WARNING
-            if total_avg_rt > 0:
-                if total_avg_rt < 250: rt_rank, rt_color = "S (神速)", COLOR_CYAN
-                elif total_avg_rt < 350: rt_rank, rt_color = "A (優秀)", COLOR_GREEN
-                elif total_avg_rt < 450: rt_rank, rt_color = "B (普通)", COLOR_WARNING
-            
-            sp_rank, sp_color = "C (加油)", COLOR_WARNING
-            if total_avg_sp > 0:
-                if total_avg_sp >= 4.5: sp_rank, sp_color = "S (極速)", COLOR_RED
-                elif total_avg_sp >= 3.0: sp_rank, sp_color = "A (優秀)", COLOR_GREEN
-                elif total_avg_sp >= 1.5: sp_rank, sp_color = "B (普通)", COLOR_WARNING
-            
-            cx = int(w/2)
-            img = self.put_chinese_text(img, "=== 最終測驗報告 ===", (cx, int(h*0.08)), COLOR_TEXT, 50, 2, center_align=True)
-            
-            col_y_start = int(h * 0.22)
-            line_gap = 45
-            
-            lx = int(w * 0.25)
-            img = self.put_chinese_text(img, "【左手】", (lx, col_y_start), COLOR_CYAN, 45, 2, center_align=True)
-            img = self.put_chinese_text(img, f"平均反應: {l_rt:.0f} ms", (lx, col_y_start + line_gap), COLOR_TEXT, 30, center_align=True)
-            img = self.put_chinese_text(img, f"平均均速: {l_sp:.1f} m/s", (lx, col_y_start + line_gap*2), COLOR_TEXT, 30, center_align=True)
-            
-            rx = int(w * 0.75)
-            img = self.put_chinese_text(img, "【右手】", (rx, col_y_start), COLOR_RED, 45, 2, center_align=True)
-            img = self.put_chinese_text(img, f"平均反應: {r_rt:.0f} ms", (rx, col_y_start + line_gap), COLOR_TEXT, 30, center_align=True)
-            img = self.put_chinese_text(img, f"平均均速: {r_sp:.1f} m/s", (rx, col_y_start + line_gap*2), COLOR_TEXT, 30, center_align=True)
-            
-            rank_y = int(h * 0.52)
-            img = self.put_chinese_text(img, f"反應評級: {rt_rank}", (cx - 160, rank_y), rt_color, 45, 2, center_align=True)
-            img = self.put_chinese_text(img, f"拳速評級: {sp_rank}", (cx + 160, rank_y), sp_color, 45, 2, center_align=True)
-            img = self.put_chinese_text(img, f"命中率: {accuracy:.0f}% ({self.hit_count}/10)", (cx, rank_y + 80), COLOR_GREEN, 55, 3, center_align=True)
-            
-            # 如果截圖還不存在，保存當前完成繪製的畫面
-            if self.final_image is None:
-                self.final_image = img.copy()
-
-            remain_time = 8.0 - (time.time() - self.game_over_time) # 延長至 8 秒方便下載
-            if remain_time <= 0:
-                self.reset_game()
-            else:
-                img = self.put_chinese_text(img, f"系統將在 {int(remain_time)+1} 秒後重新開始...", (cx, h-60), (150,150,150), 30, center_align=True)
-
-        elif self.state == 'WAIT_GUARD':
-            hold_time = 3.0 if self.is_first_round else 2.0
-            img = self.put_chinese_text(img, f"Round {self.current_round + 1}/10", (30, 50), COLOR_TEXT, 40, 2)
-            
-            elapsed = time.time() - self.start_time
-            remain = max(0.0, hold_time - elapsed)
-            cx, cy = int(w/2), int(h/2)
-
-            if coords:
-                l_guard = coords['R_WR'][1] < coords['R_SH'][1] + 60
-                r_guard = coords['L_WR'][1] < coords['L_SH'][1] + 60
-                
-                if l_guard and r_guard:
-                    bar_len = 300
-                    prog = min(elapsed / hold_time, 1.0)
-                    cv2.rectangle(img, (cx - bar_len//2, cy+80), (cx - bar_len//2 + int(bar_len*prog), cy+100), COLOR_GREEN, -1)
-                    cv2.rectangle(img, (cx - bar_len//2, cy+80), (cx + bar_len//2, cy+100), COLOR_TEXT, 2)
-                    img = self.put_chinese_text(img, f"保持防禦... {remain:.1f}", (cx, cy), COLOR_GREEN, 40, 2, center_align=True)
-                    
-                    if elapsed >= hold_time:
-                        self.state = 'COUNTDOWN'
-                        self.start_time = time.time()
-                else:
-                    self.start_time = time.time()
-                    img = self.put_chinese_text(img, "請舉起雙手", (cx, cy), COLOR_WARNING, 50, 2, center_align=True)
-            else:
-                 img = self.put_chinese_text(img, "偵測不到人像", (cx, cy), COLOR_ERROR, 40, 2, center_align=True)
-
-        elif self.state == 'COUNTDOWN':
-            delay = random.uniform(0.8, 2.0)
-            if time.time() - self.start_time > delay:
-                self.state = 'STIMULUS'
-                self.target = random.choice(['LEFT', 'RIGHT'])
-                self.stimulus_time = time.time()
-                self.max_speed_in_round = 0
-                self.speed_buffer = [] # 回合開始前清空舊速度
-            else:
-                cv2.circle(img, (int(w/2), int(h/2)), 25, (255, 255, 255), -1)
-
-        elif self.state == 'STIMULUS':
-            text = "左拳!" if self.target == 'LEFT' else "右拳!"
-            color = COLOR_CYAN if self.target == 'LEFT' else COLOR_RED
-            img = self.put_chinese_text(img, text, (int(w/2), int(h/2)-50), color, 120, 5, center_align=True)
-            
-            if coords:
-                speed, is_punch, punched_hand, completion = self.detect_punch_v4(coords, dt)
-                
-                bar_w = int(w * 0.7)
-                bar_h = 25
-                start_x = int((w - bar_w) / 2)
-                start_y = h - 60
-                
-                cv2.rectangle(img, (start_x, start_y), (start_x + bar_w, start_y + bar_h), (50, 50, 50), -1) 
-                cv2.rectangle(img, (start_x, start_y), (start_x + int(bar_w * completion), start_y + bar_h), COLOR_WARNING, -1) 
-                cv2.rectangle(img, (start_x, start_y), (start_x + bar_w, start_y + bar_h), COLOR_TEXT, 2) 
-                img = self.put_chinese_text(img, f"動作完成度: {int(completion*100)}%", (start_x, start_y - 35), COLOR_TEXT, 25)
-                
-                if speed > self.max_speed_in_round:
-                    self.max_speed_in_round = speed
-                
-                if is_punch:
-                    rt = (time.time() - self.stimulus_time) * 1000
-                    if rt > 60:
-                        is_hit = (punched_hand == self.target)
-                        if is_hit: self.hit_count += 1
-                        
-                        self.last_result = {
-                            "reaction": rt,
-                            "speed": self.max_speed_in_round,
-                            "target": self.target,
-                            "punched_hand": punched_hand,
-                            "is_hit": is_hit
-                        }
-                        
-                        if punched_hand == 'LEFT':
-                            self.left_stats['reaction'].append(rt)
-                            self.left_stats['speed'].append(self.max_speed_in_round)
-                        else:
-                            self.right_stats['reaction'].append(rt)
-                            self.right_stats['speed'].append(self.max_speed_in_round)
-                            
-                        self.state = 'RESULT'
-                        self.feedback_end_time = time.time() + 1.2
-                        self.current_round += 1
-                        self.is_first_round = False
-                        
-                        if self.current_round >= self.max_rounds:
-                            self.game_over_time = time.time() + 1.2
-
-        elif self.state == 'RESULT':
-            res = self.last_result
-            cx, cy = int(w/2), int(h/2)
-            
-            if res['is_hit']:
-                img = self.put_chinese_text(img, "🎯 命中!", (cx, cy-100), COLOR_GREEN, 100, 4, center_align=True)
-            else:
-                wrong_txt = "出成右拳" if res['punched_hand'] == 'RIGHT' else "出成左拳"
-                img = self.put_chinese_text(img, "❌ 失誤!", (cx, cy-120), COLOR_ERROR, 100, 4, center_align=True)
-                img = self.put_chinese_text(img, f"({wrong_txt})", (cx, cy-40), COLOR_ERROR, 40, 2, center_align=True)
-            
-            img = self.put_chinese_text(img, f"反應: {res['reaction']:.0f} ms", (cx, cy+40), COLOR_TEXT, 45, 2, center_align=True)
-            img = self.put_chinese_text(img, f"速度: {res['speed']:.1f} m/s", (cx, cy+100), COLOR_TEXT, 45, 2, center_align=True)
-            
-            if time.time() > self.feedback_end_time:
-                if self.current_round >= self.max_rounds:
-                    self.state = 'GAME_OVER'
-                else:
-                    self.state = 'WAIT_GUARD'
-                    self.start_time = time.time()
-
-        return img
-
-class VideoProcessor(VideoTransformerBase):
-    def __init__(self):
-        self.logic = BoxingAnalystLogic()
-    def recv(self, frame):
-        try:
-            img = frame.to_ndarray(format="bgr24")
-            processed = self.logic.process(img)
-            return av.VideoFrame.from_ndarray(processed, format="bgr24")
-        except Exception:
-            return frame
-
+# ==========================================
+# 3. Streamlit UI 與主程式邏輯
+# ==========================================
 def main():
-    st.title("🥊 拳擊反應測試 V33 (雲端修復版)")
+    st.title("🥊 拳擊反應訓練 (無 cv2 極速穩定版)")
+    st.markdown("這個版本專為 Streamlit Cloud 優化，已完全移除 `cv2` 依賴，享受更低延遲的體驗！")
+
+    # 啟動 WebRTC 串流
+    ctx = webrtc_streamer(
+        key="boxing-reaction",
+        video_processor_factory=BoxingPoseProcessor,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        media_stream_constraints={
+            "video": True,
+            "audio": False
+        }
+    )
+
+    # ==========================================
+    # 4. 截圖下載功能 (免 cv2，使用 PIL + io)
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📸 成果截圖")
     
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        webrtc_ctx = webrtc_streamer(
-            key="boxing-v33",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-            video_processor_factory=VideoProcessor,
-            media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 640},
-                    "height": {"ideal": 480},
-                    "frameRate": {"ideal": 30}
-                }, 
-                "audio": False
-            },
-            async_processing=True,
-        )
-        
-    with col2:
-        st.markdown("### ☁️ V33 雲端部署修復")
-        st.markdown("""
-        **1. 權限修復 (PermissionError):**
-        * 已解決 Streamlit Community Cloud 無法寫入 MediaPipe 模型的報錯。
-        
-        **2. 核心效能保留:**
-        * 延續 V32 的平滑濾波與跳幀處理，低延遲不卡頓。
-        * 截圖下載功能支援！
-        """)
-        
-        if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
-            logic = webrtc_ctx.video_processor.logic
-            if logic.state == 'GAME_OVER' and logic.final_image is not None:
-                st.success("🎉 測驗完成！")
-                _, buffer = cv2.imencode(".jpg", logic.final_image)
+    # 確保攝影機有開啟且有抓到畫面
+    if ctx.video_processor:
+        if st.button("擷取當下畫面"):
+            if ctx.video_processor.last_frame is not None:
+                # 取得最後一幀並用 PIL 轉成 JPEG
+                img_to_save = ctx.video_processor.last_frame
+                image = Image.fromarray(img_to_save)
+                
+                # 存入記憶體緩衝區
+                buf = io.BytesIO()
+                image.save(buf, format="JPEG")
+                
+                # 顯示下載按鈕
+                st.success("截圖成功！請點擊下方按鈕下載：")
                 st.download_button(
-                    label="📸 下載成績截圖 (JPG)",
-                    data=buffer.tobytes(),
-                    file_name="boxing_result_v33.jpg",
-                    mime="image/jpeg",
-                    use_container_width=True
+                    label="⬇️ 下載圖片 (result.jpg)",
+                    data=buf.getvalue(),
+                    file_name="boxing_result.jpg",
+                    mime="image/jpeg"
                 )
+            else:
+                st.warning("請先對著鏡頭擺個姿勢，等畫面出來後再截圖喔！")
+    else:
+        st.info("請先點擊上方 'START' 開啟鏡頭。")
 
 if __name__ == "__main__":
     main()
