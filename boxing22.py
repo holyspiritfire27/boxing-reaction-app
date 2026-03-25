@@ -9,57 +9,58 @@ import random
 from PIL import ImageFont, ImageDraw, Image
 
 # ================= 配置與常數 =================
-st.set_page_config(page_title="拳擊反應 V31 (精準雙評級版)", layout="wide", page_icon="🥊")
+st.set_page_config(page_title="拳擊反應 V32 (極致流暢版)", layout="wide", page_icon="🥊")
 
 # 顏色定義 (B, G, R)
-COLOR_CYAN = (255, 255, 0)     # 左拳
-COLOR_RED = (50, 50, 255)      # 右拳
-COLOR_GREEN = (0, 255, 0)      # 成功/命中
-COLOR_ERROR = (0, 0, 255)      # 失誤
-COLOR_TEXT = (255, 255, 255)   # 白字
-COLOR_WARNING = (0, 165, 255)  # 橘色
+COLOR_CYAN = (255, 255, 0)
+COLOR_RED = (50, 50, 255)
+COLOR_GREEN = (0, 255, 0)
+COLOR_ERROR = (0, 0, 255)
+COLOR_TEXT = (255, 255, 255)
+COLOR_WARNING = (0, 165, 255)
 
-# 物理常數
-SHOULDER_WIDTH_M = 0.45  # 假設肩寬 0.45 米
+SHOULDER_WIDTH_M = 0.45 
 
 class BoxingAnalystLogic:
     def __init__(self):
-        # MediaPipe 初始化
         self.mp_pose = mp.solutions.pose
+        # ⚡ 優化 2: 降低 model_complexity 減輕運算負擔
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            model_complexity=1
+            model_complexity=0 
         )
         
-        # 狀態機
         self.state = 'WAIT_GUARD' 
         self.start_time = 0
         self.stimulus_time = 0
         self.target = None 
         self.game_over_time = 0
         
-        # 流程控制
         self.max_rounds = 10
         self.current_round = 0
         self.is_first_round = True
         
-        # 數據記錄
         self.hit_count = 0 
         self.left_stats = {'reaction': [], 'speed': []}
         self.right_stats = {'reaction': [], 'speed': []}
         self.last_result = {"reaction": 0, "speed": 0, "target": "", "punched_hand": "", "is_hit": False}
         
-        # 物理計算變數
         self.prev_landmarks = None
         self.prev_time = 0
         self.max_speed_in_round = 0.0
         
-        # 字型設定
+        # ⚡ 優化 1: 滑動最大速度緩衝區
+        self.speed_buffer = []
+        self.buffer_size = 5
+        
+        # ⚡ 跳幀計數器與截圖儲存
+        self.frame_count = 0
+        self.final_image = None
+        
         self.font_path = "font.ttf" 
 
     def put_chinese_text(self, img, text, pos, color, size=30, stroke_width=0, center_align=False):
-        """ 繪製中文文字 """
         img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(img_pil)
         
@@ -72,7 +73,6 @@ class BoxingAnalystLogic:
                 return img
         
         pil_color = (color[2], color[1], color[0])
-        
         bbox = draw.textbbox((0, 0), text, font=font)
         text_w = bbox[2] - bbox[0]
         
@@ -88,7 +88,7 @@ class BoxingAnalystLogic:
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
     def get_landmarks(self, results, width, height):
-        if not results.pose_landmarks:
+        if not results or not results.pose_landmarks:
             return None
         lm = results.pose_landmarks.landmark
         coords = {}
@@ -98,10 +98,6 @@ class BoxingAnalystLogic:
         return coords
 
     def detect_punch_v4(self, coords, dt):
-        """ 
-        V4.1 雙手監測 (修正左右顛倒)：
-        因使用鏡面翻轉，使用者的「真實左手」對應的是 MediaPipe 的「右手」。
-        """
         if not self.prev_landmarks or dt <= 0:
             return 0.0, False, None, 0.0
             
@@ -111,10 +107,7 @@ class BoxingAnalystLogic:
         
         hands_data = {}
         
-        # 修正左右判斷：Physical Hand 對應的 MediaPipe 節點
         for physical_hand in ['LEFT', 'RIGHT']:
-            # 真實左手 -> MP 右節點 (R_SH, R_EL, R_WR)
-            # 真實右手 -> MP 左節點 (L_SH, L_EL, L_WR)
             if physical_hand == 'LEFT':
                 sh_key, el_key, wr_key = 'R_SH', 'R_EL', 'R_WR'
             else:
@@ -122,7 +115,6 @@ class BoxingAnalystLogic:
             
             wrist_disp = np.linalg.norm(coords[wr_key] - self.prev_landmarks[wr_key])
             wrist_speed = (wrist_disp / pixels_per_meter) / dt
-            
             elbow_disp = np.linalg.norm(coords[el_key] - self.prev_landmarks[el_key])
             elbow_speed = (elbow_disp / pixels_per_meter) / dt
             
@@ -133,14 +125,20 @@ class BoxingAnalystLogic:
             composite_speed = (wrist_speed * 0.6) + (elbow_speed * 0.4)
             hands_data[physical_hand] = {'speed': composite_speed, 'is_extending': is_extending}
             
-        # 找出當前移動最快的手 (真實的手)
         fastest_hand = 'LEFT' if hands_data['LEFT']['speed'] > hands_data['RIGHT']['speed'] else 'RIGHT'
-        max_speed = hands_data[fastest_hand]['speed']
+        raw_max_speed = hands_data[fastest_hand]['speed']
         is_extending = hands_data[fastest_hand]['is_extending']
+        
+        # ⚡ 優化 1: 滑動最大速度 (解決抖動誤判)
+        self.speed_buffer.append(raw_max_speed)
+        if len(self.speed_buffer) > self.buffer_size:
+            self.speed_buffer.pop(0)
+        
+        smoothed_speed = max(self.speed_buffer)
+        max_speed = smoothed_speed  # 使用平滑後的速度
         
         threshold_normal = 0.5   
         threshold_explosive = 1.2 
-        
         completion = min(max_speed / threshold_normal, 1.0)
         
         is_punch = False
@@ -157,31 +155,40 @@ class BoxingAnalystLogic:
         self.left_stats = {'reaction': [], 'speed': []}
         self.right_stats = {'reaction': [], 'speed': []}
         self.prev_landmarks = None
+        self.speed_buffer = [] # 清空速度緩衝
+        self.final_image = None # ⚡ 清空舊截圖
 
     def process(self, img):
-        img = cv2.flip(img, 1) # 鏡面翻轉
+        img = cv2.flip(img, 1) 
         h, w, _ = img.shape
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(img_rgb)
         
         current_time = time.time()
         dt = current_time - self.prev_time
-        self.prev_time = current_time
         
-        coords = self.get_landmarks(results, w, h)
-        
-        if results.pose_landmarks:
+        # ⚡ 優化 3: 跳幀處理 (不跳過 UI 繪製，只跳過耗時的 Pose 推論)
+        self.frame_count += 1
+        if self.frame_count % 2 != 0:
+            # 奇數幀：執行骨架辨識
+            results = self.pose.process(img_rgb)
+            coords = self.get_landmarks(results, w, h)
+            self.prev_time = current_time # 只有在推論時才更新時間與座標
+            self.prev_landmarks = coords
+        else:
+            # 偶數幀：沿用上一幀的座標，不跑辨識 (省資源)
+            results = None
+            coords = self.prev_landmarks
+
+        # 畫骨架
+        if results and results.pose_landmarks:
             mp.solutions.drawing_utils.draw_landmarks(img, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
         # ================= 狀態機 =================
-        
         if self.state == 'GAME_OVER':
-            # 背景遮罩
             overlay = img.copy()
             cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
             img = cv2.addWeighted(overlay, 0.92, img, 0.08, 0)
             
-            # 計算數據 (排除0的狀況)
             all_rt = self.left_stats['reaction'] + self.right_stats['reaction']
             all_sp = self.left_stats['speed'] + self.right_stats['speed']
             
@@ -195,49 +202,44 @@ class BoxingAnalystLogic:
             
             accuracy = (self.hit_count / 10) * 100
             
-            # ================= 雙評級系統 =================
-            # 1. 反應時間評級 (越低越好)
             rt_rank, rt_color = "C (加油)", COLOR_WARNING
             if total_avg_rt > 0:
                 if total_avg_rt < 250: rt_rank, rt_color = "S (神速)", COLOR_CYAN
                 elif total_avg_rt < 350: rt_rank, rt_color = "A (優秀)", COLOR_GREEN
                 elif total_avg_rt < 450: rt_rank, rt_color = "B (普通)", COLOR_WARNING
             
-            # 2. 拳速評級 (越高越好)
             sp_rank, sp_color = "C (加油)", COLOR_WARNING
             if total_avg_sp > 0:
                 if total_avg_sp >= 4.5: sp_rank, sp_color = "S (極速)", COLOR_RED
                 elif total_avg_sp >= 3.0: sp_rank, sp_color = "A (優秀)", COLOR_GREEN
                 elif total_avg_sp >= 1.5: sp_rank, sp_color = "B (普通)", COLOR_WARNING
             
-            # === UI 排版 ===
             cx = int(w/2)
             img = self.put_chinese_text(img, "=== 最終測驗報告 ===", (cx, int(h*0.08)), COLOR_TEXT, 50, 2, center_align=True)
             
             col_y_start = int(h * 0.22)
             line_gap = 45
             
-            # 左手欄位
             lx = int(w * 0.25)
             img = self.put_chinese_text(img, "【左手】", (lx, col_y_start), COLOR_CYAN, 45, 2, center_align=True)
             img = self.put_chinese_text(img, f"平均反應: {l_rt:.0f} ms", (lx, col_y_start + line_gap), COLOR_TEXT, 30, center_align=True)
             img = self.put_chinese_text(img, f"平均均速: {l_sp:.1f} m/s", (lx, col_y_start + line_gap*2), COLOR_TEXT, 30, center_align=True)
             
-            # 右手欄位
             rx = int(w * 0.75)
             img = self.put_chinese_text(img, "【右手】", (rx, col_y_start), COLOR_RED, 45, 2, center_align=True)
             img = self.put_chinese_text(img, f"平均反應: {r_rt:.0f} ms", (rx, col_y_start + line_gap), COLOR_TEXT, 30, center_align=True)
             img = self.put_chinese_text(img, f"平均均速: {r_sp:.1f} m/s", (rx, col_y_start + line_gap*2), COLOR_TEXT, 30, center_align=True)
             
-            # 評級與命中率顯示 (置中橫排)
             rank_y = int(h * 0.52)
             img = self.put_chinese_text(img, f"反應評級: {rt_rank}", (cx - 160, rank_y), rt_color, 45, 2, center_align=True)
             img = self.put_chinese_text(img, f"拳速評級: {sp_rank}", (cx + 160, rank_y), sp_color, 45, 2, center_align=True)
-            
             img = self.put_chinese_text(img, f"命中率: {accuracy:.0f}% ({self.hit_count}/10)", (cx, rank_y + 80), COLOR_GREEN, 55, 3, center_align=True)
             
-            # 自動重啟倒數
-            remain_time = 5.0 - (current_time - self.game_over_time)
+            # ⚡ 如果截圖還不存在，保存當前完成繪製的畫面
+            if self.final_image is None:
+                self.final_image = img.copy()
+
+            remain_time = 8.0 - (time.time() - self.game_over_time) # 延長至 8 秒方便下載
             if remain_time <= 0:
                 self.reset_game()
             else:
@@ -247,13 +249,11 @@ class BoxingAnalystLogic:
             hold_time = 3.0 if self.is_first_round else 2.0
             img = self.put_chinese_text(img, f"Round {self.current_round + 1}/10", (30, 50), COLOR_TEXT, 40, 2)
             
-            elapsed = current_time - self.start_time
+            elapsed = time.time() - self.start_time
             remain = max(0.0, hold_time - elapsed)
             cx, cy = int(w/2), int(h/2)
 
             if coords:
-                # 修正：偵測防禦也需映射物理左右手
-                # 真實左手(R_WR) < 真實左肩(R_SH)
                 l_guard = coords['R_WR'][1] < coords['R_SH'][1] + 60
                 r_guard = coords['L_WR'][1] < coords['L_SH'][1] + 60
                 
@@ -262,25 +262,25 @@ class BoxingAnalystLogic:
                     prog = min(elapsed / hold_time, 1.0)
                     cv2.rectangle(img, (cx - bar_len//2, cy+80), (cx - bar_len//2 + int(bar_len*prog), cy+100), COLOR_GREEN, -1)
                     cv2.rectangle(img, (cx - bar_len//2, cy+80), (cx + bar_len//2, cy+100), COLOR_TEXT, 2)
-                    
                     img = self.put_chinese_text(img, f"保持防禦... {remain:.1f}", (cx, cy), COLOR_GREEN, 40, 2, center_align=True)
                     
                     if elapsed >= hold_time:
                         self.state = 'COUNTDOWN'
-                        self.start_time = current_time
+                        self.start_time = time.time()
                 else:
-                    self.start_time = current_time
+                    self.start_time = time.time()
                     img = self.put_chinese_text(img, "請舉起雙手", (cx, cy), COLOR_WARNING, 50, 2, center_align=True)
             else:
                  img = self.put_chinese_text(img, "偵測不到人像", (cx, cy), COLOR_ERROR, 40, 2, center_align=True)
 
         elif self.state == 'COUNTDOWN':
             delay = random.uniform(0.8, 2.0)
-            if current_time - self.start_time > delay:
+            if time.time() - self.start_time > delay:
                 self.state = 'STIMULUS'
                 self.target = random.choice(['LEFT', 'RIGHT'])
-                self.stimulus_time = current_time
+                self.stimulus_time = time.time()
                 self.max_speed_in_round = 0
+                self.speed_buffer = [] # 回合開始前清空舊速度
             else:
                 cv2.circle(img, (int(w/2), int(h/2)), 25, (255, 255, 255), -1)
 
@@ -292,7 +292,6 @@ class BoxingAnalystLogic:
             if coords:
                 speed, is_punch, punched_hand, completion = self.detect_punch_v4(coords, dt)
                 
-                # 動作完成度進度條
                 bar_w = int(w * 0.7)
                 bar_h = 25
                 start_x = int((w - bar_w) / 2)
@@ -307,11 +306,10 @@ class BoxingAnalystLogic:
                     self.max_speed_in_round = speed
                 
                 if is_punch:
-                    rt = (current_time - self.stimulus_time) * 1000
+                    rt = (time.time() - self.stimulus_time) * 1000
                     if rt > 60:
                         is_hit = (punched_hand == self.target)
-                        if is_hit:
-                            self.hit_count += 1
+                        if is_hit: self.hit_count += 1
                         
                         self.last_result = {
                             "reaction": rt,
@@ -329,12 +327,12 @@ class BoxingAnalystLogic:
                             self.right_stats['speed'].append(self.max_speed_in_round)
                             
                         self.state = 'RESULT'
-                        self.feedback_end_time = current_time + 1.2
+                        self.feedback_end_time = time.time() + 1.2
                         self.current_round += 1
                         self.is_first_round = False
                         
                         if self.current_round >= self.max_rounds:
-                            self.game_over_time = current_time + 1.2
+                            self.game_over_time = time.time() + 1.2
 
         elif self.state == 'RESULT':
             res = self.last_result
@@ -350,14 +348,13 @@ class BoxingAnalystLogic:
             img = self.put_chinese_text(img, f"反應: {res['reaction']:.0f} ms", (cx, cy+40), COLOR_TEXT, 45, 2, center_align=True)
             img = self.put_chinese_text(img, f"速度: {res['speed']:.1f} m/s", (cx, cy+100), COLOR_TEXT, 45, 2, center_align=True)
             
-            if current_time > self.feedback_end_time:
+            if time.time() > self.feedback_end_time:
                 if self.current_round >= self.max_rounds:
                     self.state = 'GAME_OVER'
                 else:
                     self.state = 'WAIT_GUARD'
-                    self.start_time = current_time
+                    self.start_time = time.time()
 
-        self.prev_landmarks = coords
         return img
 
 class VideoProcessor(VideoTransformerBase):
@@ -372,32 +369,55 @@ class VideoProcessor(VideoTransformerBase):
             return frame
 
 def main():
-    st.title("🥊 拳擊反應測試 V31 (精準雙評級版)")
+    st.title("🥊 拳擊反應測試 V32 (極致流暢版)")
     
     col1, col2 = st.columns([3, 1])
+    
     with col1:
-        webrtc_streamer(
-            key="boxing-v31",
+        # ⚡ 優化 2: 設定低解析度限制，大幅提升畫面更新率
+        webrtc_ctx = webrtc_streamer(
+            key="boxing-v32",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
             video_processor_factory=VideoProcessor,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 30}
+                }, 
+                "audio": False
+            },
             async_processing=True,
         )
+        
     with col2:
-        st.markdown("### 🛠️ V31 更新亮點")
+        st.markdown("### ⚡ V32 性能覺醒")
         st.markdown("""
-        **1. 修正左右鏡面映射:**
-        * 解決了出真實左拳卻被誤判為右拳的問題，現在**直覺與畫面完全一致**。
+        **1. 消除抖動誤判:**
+        * 導入動態滑動視窗緩衝技術，慢拳快拳差異更清晰！
         
-        **2. 獨立雙評級系統:**
-        * **⚡ 反應評級:** 越低越快 (S神速 / A優秀 / B普通)
-        * **🚀 拳速評級:** 越高越強 (S極速 / A優秀 / B普通)
+        **2. FPS 大幅提升:**
+        * 降低運算負載與智慧跳幀，操作更跟手。
         
-        **3. 順暢體驗:**
-        * 底部顯示實時動作完成度。
-        * 結束後停留 5 秒自動啟動新一輪。
+        **3. 戰績一鍵下載:**
+        * 測驗結束後提供專屬截圖存檔。
         """)
+        
+        # ⚡ 下載按鈕 (確保從 WebRTC 的背景執行緒中安全讀取圖片)
+        if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+            logic = webrtc_ctx.video_processor.logic
+            if logic.state == 'GAME_OVER' and logic.final_image is not None:
+                st.success("🎉 測驗完成！")
+                # 轉檔 JPG
+                _, buffer = cv2.imencode(".jpg", logic.final_image)
+                st.download_button(
+                    label="📸 下載成績截圖 (JPG)",
+                    data=buffer.tobytes(),
+                    file_name="boxing_result_v32.jpg",
+                    mime="image/jpeg",
+                    use_container_width=True
+                )
 
 if __name__ == "__main__":
     main()
