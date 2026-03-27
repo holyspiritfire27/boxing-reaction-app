@@ -11,13 +11,18 @@ from streamlit_webrtc import webrtc_streamer
 # ==========================================
 # 1. 頁面與 MediaPipe 初始化
 # ==========================================
-st.set_page_config(page_title="Boxing Reaction App", page_icon="🥊", layout="wide")
+st.set_page_config(page_title="拳擊反應訓練器", page_icon="🥊", layout="wide")
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
+# 設定遊戲總拳數
+TOTAL_GAME_PUNCHES = 10
+# 設定擊中距離閾值 (像素)，數字越大越容易擊中 (閾值越低)
+HIT_DISTANCE_THRESHOLD = 80 
+
 # ==========================================
-# 2. 核心影像處理器 (加入測速與反應判定)
+# 2. 核心影像處理器 (固定目標、距離判定、統計結算)
 # ==========================================
 class BoxingPoseProcessor:
     def __init__(self):
@@ -29,28 +34,41 @@ class BoxingPoseProcessor:
         self.last_frame = None
         
         # --- 遊戲與判定狀態 ---
-        self.score = 0
-        self.state = "WAITING"         # 狀態：WAITING (等標靶), ACTIVE (標靶出現)
-        self.target_box = None         # 標靶座標 (x1, y1, x2, y2)
+        self.total_hits = 0            # 當前總擊中次數
+        self.state = "WAITING"         # 狀態：WAITING (準備), ACTIVE (出拳提示), FINISHED (結束)
         self.target_hand = None        # 目標手："LEFT" 或 "RIGHT"
-        self.spawn_time = 0            # 標靶出現時間
+        self.spawn_time = 0            # 提示出現時間
         self.last_reaction_time = 0.0  # 上次反應時間
-        self.wait_until = time.time() + 2 # 初始給予2秒準備時間
+        self.wait_until = time.time() + 3 # 初始準備時間 3 秒
         
-        # --- 測速相關變數 ---
+        # --- 測速與統計相關變數 ---
         self.prev_time = time.time()
         self.prev_lw = None            # 上一幀左手座標
         self.prev_rw = None            # 上一幀右手座標
-        self.left_speed = 0.0          # 左手速度 (像素/秒)
-        self.right_speed = 0.0         # 右手速度 (像素/秒)
+        self.left_speed = 0.0          # 當前左手速度
+        self.right_speed = 0.0         # 當前右手速度
+        
+        # --- 統計數據累加器 ---
+        self.left_hits = 0
+        self.right_hits = 0
+        self.left_total_speed = 0.0
+        self.left_total_reaction = 0.0
+        self.right_total_speed = 0.0
+        self.right_total_reaction = 0.0
+        self.final_results = None      # 儲存最終結算結果的字典
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # 1. 取得影像並做鏡像翻轉 (讓動作更直覺)
+        # 1. 取得影像並做鏡像翻轉
         img = frame.to_ndarray(format="rgb24")
         img = np.ascontiguousarray(np.fliplr(img))
         h, w, _ = img.shape
         
-        # 計算時間差 (用來算速度)
+        # 如果遊戲已結束，直接回傳原始影像 (或可以加上"遊戲結束"浮水印)
+        if self.state == "FINISHED":
+            self.last_frame = img.copy()
+            return av.VideoFrame.from_ndarray(img, format="rgb24")
+
+        # 計算時間差
         curr_time = time.time()
         dt = curr_time - self.prev_time
         self.prev_time = curr_time
@@ -65,89 +83,126 @@ class BoxingPoseProcessor:
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
             
-            # 取得左右手腕的座標 (將比例還原成真實像素座標)
+            # 👉 A. 計算絕對準心 (嘴巴中心)
+            m_left = landmarks[mp_pose.PoseLandmark.MOUTH_LEFT.value]
+            m_right = landmarks[mp_pose.PoseLandmark.MOUTH_RIGHT.value]
+            # 計算像素座標 center = (left+right)/2
+            target_center = (int((m_left.x + m_right.x) * w / 2), 
+                             int((m_left.y + m_right.y) * h / 2))
+            
+            # 取得左右手腕的座標
             lw = (int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * w), 
                   int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * h))
             rw = (int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x * w), 
                   int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y * h))
             
-            # --- 計算瞬間拳速 (距離 / 時間差) ---
+            # 👉 B. 計算瞬間拳速 (px/s)
             if self.prev_lw and dt > 0:
                 dist_l = np.sqrt((lw[0] - self.prev_lw[0])**2 + (lw[1] - self.prev_lw[1])**2)
                 self.left_speed = dist_l / dt
             if self.prev_rw and dt > 0:
                 dist_r = np.sqrt((rw[0] - self.prev_rw[0])**2 + (rw[1] - self.prev_rw[1])**2)
                 self.right_speed = dist_r / dt
-                
-            # 紀錄當前座標供下一幀使用
-            self.prev_lw = lw
-            self.prev_rw = rw
+            self.prev_lw = lw; self.prev_rw = rw
 
-            # --- 遊戲邏輯：標靶生成與擊中判定 ---
+            # 👉 C. 繪製固定目標 (嘴巴位置，畫一個圓形準心)
+            t_color = (255, 255, 0) # 黃色準心
+            r = 20 # 準心半徑
+            draw.ellipse([target_center[0]-r, target_center[1]-r, target_center[0]+r, target_center[1]+r], outline=t_color, width=3)
+            # 畫十字線
+            draw.line([target_center[0]-r-10, target_center[1], target_center[0]+r+10, target_center[1]], fill=t_color, width=2)
+            draw.line([target_center[0], target_center[1]-r-10, target_center[0], target_center[1]+r+10], fill=t_color, width=2)
+
+            # 👉 D. 遊戲與判定邏輯
             if self.state == "WAITING":
                 if curr_time >= self.wait_until:
-                    # 隨機決定出左手還是右手
-                    box_size = 100
-                    if random.choice(["LEFT", "RIGHT"]) == "LEFT":
-                        self.target_hand = "LEFT"
-                        # 左手標靶產生在畫面左半部
-                        tx = random.randint(50, (w//2) - box_size - 10)
-                    else:
-                        self.target_hand = "RIGHT"
-                        # 右手標靶產生在畫面右半部
-                        tx = random.randint((w//2) + 10, w - box_size - 50)
-                        
-                    ty = random.randint(50, h//2) # 產生在畫面上半部
-                    self.target_box = (tx, ty, tx+box_size, ty+box_size)
+                    # 出拳提示出現 (隨機左或右)
+                    self.target_hand = random.choice(["LEFT", "RIGHT"])
                     self.spawn_time = curr_time
                     self.state = "ACTIVE"
                     
-            elif self.state == "ACTIVE" and self.target_box:
-                tx1, ty1, tx2, ty2 = self.target_box
+            elif self.state == "ACTIVE":
+                # 繪製中文出拳提示 (左上角)
+                p_text = "請出左拳！" if self.target_hand == "LEFT" else "請出右拳！"
+                p_color = (255, 100, 50) if self.target_hand == "LEFT" else (50, 150, 255)
+                # 為了避免中文型設問題，我們先畫一個醒目的色塊
+                draw.rectangle([(w//2 - 120, 20), (w//2 + 120, 80)], fill=p_color)
+                # 注意：Streamlit Cloud 的默認字型可能不支援中文顯示，若顯示為方塊，我們用醒目色塊代替。
+                # 這裡嘗試寫入文字，若失敗通常會顯示為空白或方塊。
+                # 終極解法是上傳中文字型檔(.ttf)並指定載入，這裡我們先維持原狀，色塊已足夠明顯分辨左右。
+                draw.text((w//2 - 100, 35), p_text, fill=(255, 255, 255))
                 
-                # 繪製標靶 (左手用橘紅色，右手用藍色)
-                target_color = (255, 100, 50) if self.target_hand == "LEFT" else (50, 150, 255)
-                draw.rectangle([tx1, ty1, tx2, ty2], outline=target_color, width=6)
-                draw.text((tx1+5, ty1-15), f"USE {self.target_hand} HAND!", fill=target_color)
+                # 👉 E. 降低閾值的距離判定法
+                # 計算提示手的手腕距離嘴巴中心點的距離
+                relevant_wrist = lw if self.target_hand == "LEFT" else rw
+                current_speed = self.left_speed if self.target_hand == "LEFT" else self.right_speed
+                dist_to_target = np.sqrt((relevant_wrist[0] - target_center[0])**2 + (relevant_wrist[1] - target_center[1])**2)
                 
-                # 判定是否擊中：檢查對應的手腕座標是否進入標靶框內
                 hit = False
-                if self.target_hand == "LEFT" and (tx1 < lw[0] < tx2 and ty1 < lw[1] < ty2):
-                    hit = True
-                elif self.target_hand == "RIGHT" and (tx1 < rw[0] < tx2 and ty1 < rw[1] < ty2):
-                    hit = True
+                if dist_to_target < HIT_DISTANCE_THRESHOLD:
+                    # 只有在速度超過一定門檻時才算"有效出拳"，避免手放在嘴邊就一直得分
+                    # 這裡設定一個低門檻例如 300 px/s
+                    if current_speed > 300: 
+                        hit = True
                     
-                # 擊中後的處理
+                # 擊中後的處理與數據累加
                 if hit:
-                    self.last_reaction_time = curr_time - self.spawn_time
-                    self.score += 1
-                    self.state = "WAITING"
-                    # 隨機等待 1 ~ 2.5 秒後出現下一個標靶
-                    self.wait_until = curr_time + random.uniform(1.0, 2.5) 
-                    self.target_box = None
+                    r_time = curr_time - self.spawn_time
+                    self.last_reaction_time = r_time
+                    self.total_hits += 1
+                    
+                    # 累加統計數據
+                    if self.target_hand == "LEFT":
+                        self.left_hits += 1
+                        self.left_total_speed += current_speed
+                        self.left_total_reaction += r_time
+                    else:
+                        self.right_hits += 1
+                        self.right_total_speed += current_speed
+                        self.right_total_reaction += r_time
+                    
+                    # 👉 F. 結算檢查
+                    if self.total_hits >= TOTAL_GAME_PUNCHES:
+                        self.state = "FINISHED"
+                        # 計算平均值並儲存結果
+                        self.final_results = {
+                            "L_AVG_SPD": int(self.left_total_speed / self.left_hits) if self.left_hits > 0 else 0,
+                            "L_AVG_REA": self.left_total_reaction / self.left_hits if self.left_hits > 0 else 0.0,
+                            "R_AVG_SPD": int(self.right_total_speed / self.right_hits) if self.right_hits > 0 else 0,
+                            "R_AVG_REA": self.right_total_reaction / self.right_hits if self.right_hits > 0 else 0.0
+                        }
+                    else:
+                        # 隨機等待 1 ~ 2 秒後出現下一個提示
+                        self.state = "WAITING"
+                        self.wait_until = curr_time + random.uniform(1.0, 2.0) 
 
             # 3. 畫出 MediaPipe 骨架 (直接畫在 numpy array 上)
-            # 因為 img 已經被 PIL 轉成 img_pil，這裡先把目前的 img_pil 轉回 numpy 畫骨架
             img_with_ui = np.array(img_pil)
             mp_drawing.draw_landmarks(
                 img_with_ui, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                 mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
                 mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2)
             )
-            # 把畫好骨架的圖交還給 PIL 繼續畫文字
             img_pil = Image.fromarray(img_with_ui)
             draw = ImageDraw.Draw(img_pil)
 
-        # 4. 在左上角顯示儀表板數據
-        info_text = (
-            f"SCORE: {self.score}\n"
-            f"REACTION: {self.last_reaction_time:.3f} sec\n"
-            f"L-SPEED: {int(self.left_speed)} px/s\n"
-            f"R-SPEED: {int(self.right_speed)} px/s"
-        )
-        # 畫一個黑色底框讓文字更清楚
-        draw.rectangle([(10, 10), (180, 80)], fill=(0, 0, 0)) 
-        draw.text((15, 15), info_text, fill=(255, 255, 255))
+        # 👉 G. 中文化儀表板 (左上角)
+        dashboard_h = 110 # 增加高度以容納更多資訊
+        draw.rectangle([(10, 10), (220, dashboard_h)], fill=(0, 0, 0)) 
+        
+        # 如果遊戲結束，顯示特殊狀態
+        if self.state == "FINISHED":
+            draw.text((15, 15), "🛑 訓練結束", fill=(255, 0, 0))
+            draw.text((15, 45), f"請看下方統計結果", fill=(255, 255, 255))
+        else:
+            info_text = (
+                f"進度: {self.total_hits}/{TOTAL_GAME_PUNCHES}\n"
+                f"反應: {self.last_reaction_time:.3f} 秒\n"
+                f"左手速: {int(self.left_speed)} px/s\n"
+                f"右手速: {int(self.right_speed)} px/s"
+            )
+            # 注意：這裡的標籤可能因為字型問題顯示為方塊，若介意，需要上傳 .ttf 字型檔。
+            draw.text((15, 15), info_text, fill=(255, 255, 255))
 
         # 將畫好的圖片轉回 numpy array
         img = np.array(img_pil)
@@ -160,9 +215,10 @@ class BoxingPoseProcessor:
 # 3. Streamlit UI 與主程式邏輯
 # ==========================================
 def main():
-    st.title("🥊 拳擊反應與測速訓練 (終極版)")
-    st.markdown("這個版本具備**動態標靶**、**反應時間計算**以及**左右手瞬間拳速偵測**。完全相容 Streamlit Cloud！")
+    st.title("🥊 拳擊反應與測速訓練器 (中文結算版)")
+    st.markdown(f"目標固定在**嘴巴**位置，出拳提示為**中文**。完成 **{TOTAL_GAME_PUNCHES}** 拳後將自動結算結果。")
 
+    # 啟動 WebRTC 串流
     ctx = webrtc_streamer(
         key="boxing-reaction",
         video_processor_factory=BoxingPoseProcessor,
@@ -175,6 +231,35 @@ def main():
         }
     )
 
+    # ==========================================
+    # 4. 結算數據顯示區域 (當遊戲結束時自動顯示)
+    # ==========================================
+    if ctx.video_processor and ctx.video_processor.state == "FINISHED":
+        results = ctx.video_processor.final_results
+        if results:
+            st.markdown("---")
+            st.header("🏆 訓練成果結算")
+            st.success(f"恭喜完成 {TOTAL_GAME_PUNCHES} 拳反應訓練！這是你的統計數據：")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("👈 左手統計")
+                st.metric(label="平均拳速", value=f"{results['L_AVG_SPD']} px/s")
+                st.metric(label="平均反應時間", value=f"{results['L_AVG_REA']:.3f} 秒")
+                
+            with col2:
+                st.subheader("👉 右手統計")
+                st.metric(label="平均拳速", value=f"{results['R_AVG_SPD']} px/s")
+                st.metric(label="平均反應時間", value=f"{results['R_AVG_REA']:.3f} 秒")
+            
+            # 提供一個重置按鈕 (重新整理頁面)
+            if st.button("🔄 重新開始新的一局"):
+                st.experimental_rerun()
+
+    # ==========================================
+    # 5. 截圖下載功能 (中文化)
+    # ==========================================
     st.markdown("---")
     st.subheader("📸 成果截圖")
     
@@ -189,7 +274,7 @@ def main():
                 
                 st.success("截圖成功！請點擊下方按鈕下載：")
                 st.download_button(
-                    label="⬇️ 下載圖片 (result.jpg)",
+                    label="⬇️ 下載圖片 (boxing_result.jpg)",
                     data=buf.getvalue(),
                     file_name="boxing_result.jpg",
                     mime="image/jpeg"
