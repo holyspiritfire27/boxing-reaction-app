@@ -4,6 +4,8 @@ import numpy as np
 import mediapipe as mp
 from PIL import Image, ImageDraw
 import io
+import time
+import random
 from streamlit_webrtc import webrtc_streamer
 
 # ==========================================
@@ -15,7 +17,7 @@ mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
 # ==========================================
-# 2. 定義核心影像處理器 (完全無 cv2)
+# 2. 核心影像處理器 (加入測速與反應判定)
 # ==========================================
 class BoxingPoseProcessor:
     def __init__(self):
@@ -24,39 +26,133 @@ class BoxingPoseProcessor:
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
-        # 用來儲存最後一幀畫面，供截圖下載使用
         self.last_frame = None
+        
+        # --- 遊戲與判定狀態 ---
+        self.score = 0
+        self.state = "WAITING"         # 狀態：WAITING (等標靶), ACTIVE (標靶出現)
+        self.target_box = None         # 標靶座標 (x1, y1, x2, y2)
+        self.target_hand = None        # 目標手："LEFT" 或 "RIGHT"
+        self.spawn_time = 0            # 標靶出現時間
+        self.last_reaction_time = 0.0  # 上次反應時間
+        self.wait_until = time.time() + 2 # 初始給予2秒準備時間
+        
+        # --- 測速相關變數 ---
+        self.prev_time = time.time()
+        self.prev_lw = None            # 上一幀左手座標
+        self.prev_rw = None            # 上一幀右手座標
+        self.left_speed = 0.0          # 左手速度 (像素/秒)
+        self.right_speed = 0.0         # 右手速度 (像素/秒)
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # 👉 1. 直接取得 RGB 格式的 numpy array
+        # 1. 取得影像並做鏡像翻轉 (讓動作更直覺)
         img = frame.to_ndarray(format="rgb24")
+        img = np.ascontiguousarray(np.fliplr(img))
+        h, w, _ = img.shape
+        
+        # 計算時間差 (用來算速度)
+        curr_time = time.time()
+        dt = curr_time - self.prev_time
+        self.prev_time = curr_time
 
-        # 👉 2. 進行骨架偵測
+        # 2. 進行骨架偵測
         results = self.pose.process(img)
 
-        # 👉 3. 畫出骨架
+        # 準備使用 PIL 畫圖
+        img_pil = Image.fromarray(img)
+        draw = ImageDraw.Draw(img_pil)
+
         if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            
+            # 取得左右手腕的座標 (將比例還原成真實像素座標)
+            lw = (int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * w), 
+                  int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * h))
+            rw = (int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x * w), 
+                  int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y * h))
+            
+            # --- 計算瞬間拳速 (距離 / 時間差) ---
+            if self.prev_lw and dt > 0:
+                dist_l = np.sqrt((lw[0] - self.prev_lw[0])**2 + (lw[1] - self.prev_lw[1])**2)
+                self.left_speed = dist_l / dt
+            if self.prev_rw and dt > 0:
+                dist_r = np.sqrt((rw[0] - self.prev_rw[0])**2 + (rw[1] - self.prev_rw[1])**2)
+                self.right_speed = dist_r / dt
+                
+            # 紀錄當前座標供下一幀使用
+            self.prev_lw = lw
+            self.prev_rw = rw
+
+            # --- 遊戲邏輯：標靶生成與擊中判定 ---
+            if self.state == "WAITING":
+                if curr_time >= self.wait_until:
+                    # 隨機決定出左手還是右手
+                    box_size = 100
+                    if random.choice(["LEFT", "RIGHT"]) == "LEFT":
+                        self.target_hand = "LEFT"
+                        # 左手標靶產生在畫面左半部
+                        tx = random.randint(50, (w//2) - box_size - 10)
+                    else:
+                        self.target_hand = "RIGHT"
+                        # 右手標靶產生在畫面右半部
+                        tx = random.randint((w//2) + 10, w - box_size - 50)
+                        
+                    ty = random.randint(50, h//2) # 產生在畫面上半部
+                    self.target_box = (tx, ty, tx+box_size, ty+box_size)
+                    self.spawn_time = curr_time
+                    self.state = "ACTIVE"
+                    
+            elif self.state == "ACTIVE" and self.target_box:
+                tx1, ty1, tx2, ty2 = self.target_box
+                
+                # 繪製標靶 (左手用橘紅色，右手用藍色)
+                target_color = (255, 100, 50) if self.target_hand == "LEFT" else (50, 150, 255)
+                draw.rectangle([tx1, ty1, tx2, ty2], outline=target_color, width=6)
+                draw.text((tx1+5, ty1-15), f"USE {self.target_hand} HAND!", fill=target_color)
+                
+                # 判定是否擊中：檢查對應的手腕座標是否進入標靶框內
+                hit = False
+                if self.target_hand == "LEFT" and (tx1 < lw[0] < tx2 and ty1 < lw[1] < ty2):
+                    hit = True
+                elif self.target_hand == "RIGHT" and (tx1 < rw[0] < tx2 and ty1 < rw[1] < ty2):
+                    hit = True
+                    
+                # 擊中後的處理
+                if hit:
+                    self.last_reaction_time = curr_time - self.spawn_time
+                    self.score += 1
+                    self.state = "WAITING"
+                    # 隨機等待 1 ~ 2.5 秒後出現下一個標靶
+                    self.wait_until = curr_time + random.uniform(1.0, 2.5) 
+                    self.target_box = None
+
+            # 3. 畫出 MediaPipe 骨架 (直接畫在 numpy array 上)
+            # 因為 img 已經被 PIL 轉成 img_pil，這裡先把目前的 img_pil 轉回 numpy 畫骨架
+            img_with_ui = np.array(img_pil)
             mp_drawing.draw_landmarks(
-                img,
-                results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
+                img_with_ui, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                 mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
                 mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2)
             )
+            # 把畫好骨架的圖交還給 PIL 繼續畫文字
+            img_pil = Image.fromarray(img_with_ui)
+            draw = ImageDraw.Draw(img_pil)
 
-        # 👉 4. 使用 PIL 畫 UI (標靶、文字)
-        img_pil = Image.fromarray(img)
-        draw = ImageDraw.Draw(img_pil)
-        
-        # 畫一個虛擬打擊目標 (紅色框框)
-        draw.rectangle([(50, 50), (150, 150)], outline=(255, 0, 0), width=3)
-        # 寫上狀態文字
-        draw.text((55, 55), "TARGET", fill=(255, 0, 0))
+        # 4. 在左上角顯示儀表板數據
+        info_text = (
+            f"SCORE: {self.score}\n"
+            f"REACTION: {self.last_reaction_time:.3f} sec\n"
+            f"L-SPEED: {int(self.left_speed)} px/s\n"
+            f"R-SPEED: {int(self.right_speed)} px/s"
+        )
+        # 畫一個黑色底框讓文字更清楚
+        draw.rectangle([(10, 10), (180, 80)], fill=(0, 0, 0)) 
+        draw.text((15, 15), info_text, fill=(255, 255, 255))
 
         # 將畫好的圖片轉回 numpy array
         img = np.array(img_pil)
 
-        # 👉 5. 將結果存下來供截圖使用，並回傳給 WebRTC 顯示
+        # 5. 存檔供截圖，並回傳
         self.last_frame = img.copy()
         return av.VideoFrame.from_ndarray(img, format="rgb24")
 
@@ -64,10 +160,9 @@ class BoxingPoseProcessor:
 # 3. Streamlit UI 與主程式邏輯
 # ==========================================
 def main():
-    st.title("🥊 拳擊反應訓練 (無 cv2 極速穩定版)")
-    st.markdown("這個版本專為 Streamlit Cloud 優化，已完全移除 `cv2` 依賴，享受更低延遲的體驗！")
+    st.title("🥊 拳擊反應與測速訓練 (終極版)")
+    st.markdown("這個版本具備**動態標靶**、**反應時間計算**以及**左右手瞬間拳速偵測**。完全相容 Streamlit Cloud！")
 
-    # 啟動 WebRTC 串流
     ctx = webrtc_streamer(
         key="boxing-reaction",
         video_processor_factory=BoxingPoseProcessor,
@@ -80,25 +175,18 @@ def main():
         }
     )
 
-    # ==========================================
-    # 4. 截圖下載功能 (免 cv2，使用 PIL + io)
-    # ==========================================
     st.markdown("---")
     st.subheader("📸 成果截圖")
     
-    # 確保攝影機有開啟且有抓到畫面
     if ctx.video_processor:
         if st.button("擷取當下畫面"):
             if ctx.video_processor.last_frame is not None:
-                # 取得最後一幀並用 PIL 轉成 JPEG
                 img_to_save = ctx.video_processor.last_frame
                 image = Image.fromarray(img_to_save)
                 
-                # 存入記憶體緩衝區
                 buf = io.BytesIO()
                 image.save(buf, format="JPEG")
                 
-                # 顯示下載按鈕
                 st.success("截圖成功！請點擊下方按鈕下載：")
                 st.download_button(
                     label="⬇️ 下載圖片 (result.jpg)",
