@@ -1,11 +1,3 @@
-import os
-import sys
-import subprocess
-
-# 🚨 暴力洗地補丁：在載入任何套件前，無情殺掉壞掉的標準版 OpenCV，並確保 headless 存活
-subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless==4.8.0.74"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 import streamlit as st
 import av
 import numpy as np
