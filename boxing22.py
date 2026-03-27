@@ -1,3 +1,20 @@
+import os
+import sys
+import subprocess
+
+# 🚨 Streamlit Cloud 終極環境修復補丁 (必須放在第 1 行) 🚨
+# 為了對抗 MediaPipe 偷渡標準版 cv2 且伺服器 apt 壞掉的問題，
+# 我們在啟動時強制清空所有 cv2，並只裝回最乾淨的 headless 版。
+if not os.path.exists("env_fixed.txt"):
+    print("🔧 偵測到環境可能衝突，正在強制修復 OpenCV...")
+    # 把所有的 opencv 徹底殺掉
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python", "opencv-python-headless"], check=False)
+    # 重新乾淨安裝 headless 版本
+    subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless==4.8.0.74"], check=False)
+    # 建立標記檔案，這樣下次重整網頁就不會再跑一次
+    with open("env_fixed.txt", "w") as f:
+        f.write("fixed")
+    print("✅ 環境修復完成！")
 import streamlit as st
 import av
 import numpy as np
