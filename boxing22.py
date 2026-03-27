@@ -1,28 +1,3 @@
-import os
-import sys
-import subprocess
-
-# 🚨 智慧型動態偵測補丁：每次啟動檢查，有毒就殺！
-try:
-    installed_packages = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).decode()
-    if "opencv-python==" in installed_packages:
-        print("🚨 發現會報錯的 opencv-python，正在強制移除並替換...")
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"], check=False)
-        subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless==4.8.0.74"], check=False)
-except:
-    pass
-
-# 🚨 真實錯誤現形術：破解 Streamlit 的錯誤遮蔽
-try:
-    import cv2
-    import mediapipe as mp
-except Exception as e:
-    import streamlit as st
-    import traceback
-    st.error("🚨 抓到真實的錯誤訊息了！請把下面這段完整貼給 AI：")
-    st.code(traceback.format_exc())
-    st.stop()
-    
 import streamlit as st
 import av
 import numpy as np
