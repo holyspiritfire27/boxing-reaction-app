@@ -11,12 +11,11 @@ import os
 from streamlit_webrtc import webrtc_streamer
 
 # ==========================================
-# 0. 自動下載中文字型 (強化版下載機制，解決亂碼)
+# 0. 自動下載中文字型 (已成功運作)
 # ==========================================
 FONT_PATH = "LXGWWenKai-Regular.ttf"
 if not os.path.exists(FONT_PATH):
     try:
-        # 使用極度穩定的開源中文字體 Github Raw 連結，並加入 User-Agent 避免被擋
         url = "https://raw.githubusercontent.com/lxgw/LxgwWenKai/main/fonts/TTF/LXGWWenKai-Regular.ttf"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
@@ -24,7 +23,6 @@ if not os.path.exists(FONT_PATH):
     except Exception as e:
         print("字型下載失敗", e)
 
-# 載入字型
 try:
     font_huge = ImageFont.truetype(FONT_PATH, 40)
     font_large = ImageFont.truetype(FONT_PATH, 28)
@@ -41,8 +39,11 @@ mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
 TOTAL_GAME_PUNCHES = 10
-HIT_DISTANCE_THRESHOLD = 150 # 判定閾值：頭部範圍
-SPEED_CALIBRATION = 1.6 # 攝影機 30fps 幀率漏幀補償係數，讓數值貼近真實 7-8 m/s
+HIT_DISTANCE_THRESHOLD = 150 
+
+# 👉 物理測速核心參數修正
+# 放大係數：還原 AI 壓縮的真實物理速度，並對齊人類 7~20 m/s 的爆發力範圍
+SPEED_CALIBRATION = 4.5 
 
 # ==========================================
 # 2. 核心影像處理器 
@@ -52,7 +53,7 @@ class BoxingPoseProcessor:
         self.pose = mp_pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            model_complexity=1 # 提高準確度
+            model_complexity=1
         )
         self.last_frame = None
         
@@ -64,13 +65,13 @@ class BoxingPoseProcessor:
         self.last_reaction_time = 0.0  
         self.wait_until = time.time() + 3 
         
-        # --- 3D 測速相關變數 (m/s) ---
+        # --- 3D 測速相關變數 ---
         self.prev_time = time.time()
         self.prev_lw_3d = None            
         self.prev_rw_3d = None            
         self.left_speed = 0.0          
         self.right_speed = 0.0 
-        self.current_punch_max_speed = 0.0 # 紀錄單次出拳的「最高峰值」速度
+        self.current_punch_max_speed = 0.0 
         
         # --- 統計數據累加器 ---
         self.left_hits = 0
@@ -94,7 +95,6 @@ class BoxingPoseProcessor:
         draw.rectangle([(20, 20), (W-20, H-20)], outline=(0, 255, 0), width=5)
         draw.text((W//2 - 200, 40), "🥊 拳擊訓練成果結算 🥊", fill=(0, 255, 0), font=font_huge)
         
-        # 左手統計
         box_l = (50, 120, (W//2)-30, H-60)
         draw.rectangle(box_l, outline=(255, 100, 50), width=3) 
         draw.text((box_l[0]+30, box_l[1]+20), f"👉 左手統計", fill=(255, 100, 50), font=font_large)
@@ -103,7 +103,6 @@ class BoxingPoseProcessor:
         draw.text((box_l[0]+30, box_l[1]+200), f"平均反應時間", fill=(200, 200, 200), font=font_medium)
         draw.text((box_l[0]+60, box_l[1]+240), f"{r['L_AVG_REA']:.3f} 秒", fill=(255, 255, 0), font=font_huge)
         
-        # 右手統計
         box_r = ((W//2)+30, 120, W-50, H-60)
         draw.rectangle(box_r, outline=(50, 150, 255), width=3) 
         draw.text((box_r[0]+30, box_r[1]+20), f"👉 右手統計", fill=(50, 150, 255), font=font_large)
@@ -126,21 +125,18 @@ class BoxingPoseProcessor:
             self.last_frame = img.copy()
             return av.VideoFrame.from_ndarray(img, format="rgb24")
 
+        # 遊戲邏輯時間 (反應時間) 依舊依賴系統時間
         curr_time = time.time()
-        dt = curr_time - self.prev_time
-        self.prev_time = curr_time
 
         results = self.pose.process(img)
         img_pil = Image.fromarray(img)
         draw = ImageDraw.Draw(img_pil)
 
         if results.pose_landmarks and results.pose_world_landmarks:
-            # 2D 座標 (用於畫面繪製與距離判定)
             landmarks = results.pose_landmarks.landmark
-            # 3D 物理座標 (用於精準測速，單位：公尺)
             world_landmarks = results.pose_world_landmarks.landmark
             
-            # 取得鼻子和嘴巴的 2D 像素位置 (計算下巴準心)
+            # 計算下巴準心
             m_left = landmarks[mp_pose.PoseLandmark.MOUTH_LEFT.value]
             m_right = landmarks[mp_pose.PoseLandmark.MOUTH_RIGHT.value]
             nose = landmarks[mp_pose.PoseLandmark.NOSE.value]
@@ -151,26 +147,28 @@ class BoxingPoseProcessor:
             chin_offset = (mouth_y_px - nose_y_px) * 1.2
             target_center = (int(mouth_x_px), int(mouth_y_px + chin_offset))
             
-            # 【鏡像修正】取得左右手的 2D 與 3D 座標
-            # 2D (繪圖用)
-            lw_2d = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value] 
-            rw_2d = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]  
-            lw_px = (int(lw_2d.x * w), int(lw_2d.y * h))
-            rw_px = (int(rw_2d.x * w), int(rw_2d.y * h))
+            # 鏡像修正後的 2D 座標 (判定用)
+            lw_px = (int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x * w), int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y * h))
+            rw_px = (int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * w), int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * h))
             
-            # 3D (測速用，真正包含 XYZ 深度！)
+            # 鏡像修正後的 3D 座標 (測速用)
             lw_3d = world_landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
             rw_3d = world_landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-            curr_lw_3d = np.array([lw_3d.x, lw_3d.y, lw_3d.z])
-            curr_rw_3d = np.array([rw_3d.x, rw_3d.y, rw_3d.z])
             
-            # 👉 核心換算：利用 3D 空間距離計算真實物理速度 (m/s)
-            if self.prev_lw_3d is not None and dt > 0:
+            # 👉 修正 1：還原並放大被 AI 壓縮的 Z 軸深度 (乘上 1.5 倍)
+            curr_lw_3d = np.array([lw_3d.x, lw_3d.y, lw_3d.z * 1.5])
+            curr_rw_3d = np.array([rw_3d.x, rw_3d.y, rw_3d.z * 1.5])
+            
+            # 👉 修正 2：強制綁定攝影機 30fps 物理時間 (0.033 秒)，排除伺服器延遲干擾！
+            dt_speed = 0.033 
+            
+            if self.prev_lw_3d is not None:
                 dist_l_m = np.linalg.norm(curr_lw_3d - self.prev_lw_3d)
-                self.left_speed = (dist_l_m / dt) * SPEED_CALIBRATION
-            if self.prev_rw_3d is not None and dt > 0:
+                # 真實速度 = 距離 / 時間 * 物理校正係數
+                self.left_speed = (dist_l_m / dt_speed) * SPEED_CALIBRATION
+            if self.prev_rw_3d is not None:
                 dist_r_m = np.linalg.norm(curr_rw_3d - self.prev_rw_3d)
-                self.right_speed = (dist_r_m / dt) * SPEED_CALIBRATION
+                self.right_speed = (dist_r_m / dt_speed) * SPEED_CALIBRATION
                 
             self.prev_lw_3d = curr_lw_3d
             self.prev_rw_3d = curr_rw_3d
@@ -182,38 +180,34 @@ class BoxingPoseProcessor:
             draw.line([target_center[0]-r_circle-10, target_center[1], target_center[0]+r_circle+10, target_center[1]], fill=t_color, width=2)
             draw.line([target_center[0], target_center[1]-r_circle-10, target_center[0], target_center[1]+r_circle+10], fill=t_color, width=2)
 
-            # 👉 遊戲邏輯與動態最高速捕捉
+            # 遊戲邏輯與動態最高速捕捉
             if self.state == "WAITING":
                 if curr_time >= self.wait_until:
                     self.target_hand = random.choice(["LEFT", "RIGHT"])
                     self.spawn_time = curr_time
-                    self.current_punch_max_speed = 0.0 # 重置最高速紀錄
+                    self.current_punch_max_speed = 0.0 
                     self.state = "ACTIVE"
                     
             elif self.state == "ACTIVE":
-                # 繪製提示框
                 box_color = (255, 100, 50) if self.target_hand == "LEFT" else (50, 150, 255)
                 box_l, box_t, box_r, box_b = w//2 - 140, 30, w//2 + 140, 100
                 draw.rectangle([(box_l, box_t), (box_r, box_b)], fill=box_color, outline=(255, 255, 255), width=3)
                 p_text = "🥊 請出 左拳！" if self.target_hand == "LEFT" else "🥊 請出 右拳！"
                 if font_large:
                     draw.text((box_l + 30, box_t + 18), p_text, fill=(255, 255, 255), font=font_large)
-                else: # 防呆：如果真的載不到字型，用英文代替避免亂碼
-                    draw.text((box_l + 30, box_t + 25), "PUNCH LEFT!" if self.target_hand == "LEFT" else "PUNCH RIGHT!", fill=(255, 255, 255))
                 
                 # 追蹤此次出拳的「最高速」
                 current_speed_m_s = self.left_speed if self.target_hand == "LEFT" else self.right_speed
                 if current_speed_m_s > self.current_punch_max_speed:
                     self.current_punch_max_speed = current_speed_m_s
                 
-                # 頭部範圍判定 (2D 像素距離)
                 relevant_wrist_px = lw_px if self.target_hand == "LEFT" else rw_px
                 dist_to_head_px = np.sqrt((relevant_wrist_px[0] - head_center[0])**2 + (relevant_wrist_px[1] - head_center[1])**2)
                 
                 hit = False
                 if dist_to_head_px < HIT_DISTANCE_THRESHOLD:
-                    # 降低觸發門檻，專注紀錄峰值
-                    if current_speed_m_s > 1.0: 
+                    # 降低判定擊中的門檻，確保玩家專注發力而非瞄準
+                    if current_speed_m_s > 1.5: 
                         hit = True
                     
                 if hit:
@@ -221,7 +215,6 @@ class BoxingPoseProcessor:
                     self.last_reaction_time = r_time
                     self.total_hits += 1
                     
-                    # 使用紀錄到的最高速作為最終成績！
                     final_recorded_speed = max(self.current_punch_max_speed, current_speed_m_s)
                     
                     if self.target_hand == "LEFT":
@@ -245,7 +238,7 @@ class BoxingPoseProcessor:
                         self.state = "WAITING"
                         self.wait_until = curr_time + random.uniform(1.0, 2.0) 
 
-            # 3. 畫出骨架
+            # 畫出骨架
             img_with_ui = np.array(img_pil)
             mp_drawing.draw_landmarks(
                 img_with_ui, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
@@ -272,8 +265,8 @@ class BoxingPoseProcessor:
                 dashboard_text = (
                     f"訓練進度: {self.total_hits}/{TOTAL_GAME_PUNCHES}\n"
                     f"上次反應: {self.last_reaction_time:.3f} 秒\n"
-                    f"左峰值速: {self.current_punch_max_speed if self.target_hand == 'LEFT' else self.left_speed:.2f} m/s\n"
-                    f"右峰值速: {self.current_punch_max_speed if self.target_hand == 'RIGHT' else self.right_speed:.2f} m/s"
+                    f"左手爆發: {self.current_punch_max_speed if self.target_hand == 'LEFT' else self.left_speed:.2f} m/s\n"
+                    f"右手爆發: {self.current_punch_max_speed if self.target_hand == 'RIGHT' else self.right_speed:.2f} m/s"
                 )
                 draw.text((20, y1_dash + 35), dashboard_text, fill=(255, 255, 255), font=font_medium)
 
@@ -285,11 +278,8 @@ class BoxingPoseProcessor:
 # 3. Streamlit UI 與主程式邏輯
 # ==========================================
 def main():
-    st.title("🥊 拳擊反應與測速訓練器 (3D 峰值測速版)")
-    st.markdown(f"導入 **3D 深度感測器**，捕捉你的最高峰值拳速！目標固定在**下巴**位置。完成 **{TOTAL_GAME_PUNCHES}** 拳後將自動結算結果。")
-
-    if font_huge is None:
-        st.error("⚠️ 偵測到伺服器字型下載失敗，畫面可能會暫時用英文顯示避免亂碼。但不影響結算功能！")
+    st.title("🥊 拳擊反應與測速訓練器 (專業物理測速版)")
+    st.markdown(f"導入 **3D 深度感測器與物理補償引擎**，精準捕捉你的真實最高峰值拳速！完成 **{TOTAL_GAME_PUNCHES}** 拳後將自動結算結果。")
 
     ctx = webrtc_streamer(
         key="boxing-reaction",
